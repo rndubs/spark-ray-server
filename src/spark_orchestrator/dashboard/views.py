@@ -148,12 +148,21 @@ class Views:
                 cur_step = int(row["step"])
                 break
 
-        # elapsed + rough steps/sec + ETA
+        # elapsed + rough steps/sec + ETA. Rate/ETA only make sense while
+        # RUNNING — a finished job has no ETA. And metrics `step` is 0-indexed
+        # (last row of an N-step run is step N-1), so display step+1 as the
+        # count of completed steps; a SUCCEEDED job with a known total reads
+        # as total/total (it ran them all).
         started = sidecar.get("started_ts")
         elapsed_s = self._elapsed_s(ray, sidecar)
-        rate = (cur_step / elapsed_s) if (cur_step and elapsed_s) else None
-        eta_s = ((total - cur_step) / rate) if (rate and total and cur_step
-                                                and total > cur_step) else None
+        disp_step = None
+        if cur_step is not None:
+            disp_step = total if (status == "SUCCEEDED" and total) else cur_step + 1
+        rate = eta_s = None
+        if running and cur_step and elapsed_s:
+            rate = cur_step / elapsed_s
+            if total and total > cur_step:
+                eta_s = (total - cur_step) / rate
 
         row = {
             "run_id": rid,
@@ -170,7 +179,7 @@ class Views:
             "variant": sidecar.get("variant") or (ray.get("metadata") or {}).get("variant"),
             "seeds": sidecar.get("seeds"),
             "mem_gb": sidecar.get("mem_gb") or (ray.get("metadata") or {}).get("mem_gb"),
-            "progress": {"step": cur_step, "total": total,
+            "progress": {"step": disp_step, "total": total,
                          "steps_per_s": round(rate, 3) if rate else None,
                          "eta_s": round(eta_s) if eta_s else None},
             "last_loss": last_loss,
