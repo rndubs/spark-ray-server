@@ -126,6 +126,24 @@ class Collector:
         with self._lock:
             self.ray_jobs = by_id
             self.host.setdefault("ray", {})["up"] = True
+            # Register a freshly-submitted job's sidecar without waiting for the
+            # 60s full scan: read its dashboard.json directly the first time
+            # Ray reports it. (The driver writes the sidecar at job start.)
+            missing = [rid for rid in by_id if rid not in self.sidecars]
+        for rid in missing:
+            doc = self._read_sidecar(rid)
+            if doc is not None:
+                with self._lock:
+                    self.sidecars[rid] = doc
+
+    def _read_sidecar(self, rid: str) -> dict | None:
+        sc = self.runs_root / rid / "dashboard.json"
+        try:
+            doc = json.loads(sc.read_text())
+        except (OSError, json.JSONDecodeError):
+            return None
+        doc["_run_dir"] = str(sc.parent)
+        return doc
 
     # ---------------------------------------------------------------- host
     def _nvidia_smi(self) -> dict | None:
