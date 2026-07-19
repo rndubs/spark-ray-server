@@ -126,11 +126,15 @@ class Collector:
         with self._lock:
             self.ray_jobs = by_id
             self.host.setdefault("ray", {})["up"] = True
-            # Register a freshly-submitted job's sidecar without waiting for the
-            # 60s full scan: read its dashboard.json directly the first time
-            # Ray reports it. (The driver writes the sidecar at job start.)
-            missing = [rid for rid in by_id if rid not in self.sidecars]
-        for rid in missing:
+            # Refresh the sidecar for every new or still-active job each poll
+            # (cheap: one file each, few active jobs). The driver rewrites the
+            # sidecar at start, again once the child pid is known, and at
+            # finalize — so a 60s-only scan would miss the pid (needed for the
+            # RSS/GPU-mem samplers) and live status for up to a minute.
+            refresh = [rid for rid, j in by_id.items()
+                       if rid not in self.sidecars
+                       or STATUS_MAP.get(j.get("status")) in ("RUNNING", "PENDING")]
+        for rid in refresh:
             doc = self._read_sidecar(rid)
             if doc is not None:
                 with self._lock:
