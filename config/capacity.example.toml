@@ -37,5 +37,7 @@ symlink_assets = [
   ".venv-serve",
   "data/brepgraph",
   "data/hexagent_traces",
+  "data/hexgen",
+  "data/hexgen_p2",
   "target/release",
 ]

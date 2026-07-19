@@ -111,7 +111,8 @@ def gate3():
     a = submit("gate3-pin", "git rev-parse HEAD && sleep 25", 1)
     wait_status(a, {"RUNNING"})
     time.sleep(4)  # let the driver finish worktree add
-    ssh(f"git -C {REPO} commit --allow-empty -q -m gate3-pin-test")
+    ssh(f"git -C {REPO} -c user.name=gate3 -c user.email=gate3@test "
+        f"commit --allow-empty -q -m gate3-pin-test")
     sha1 = ssh(f"git -C {REPO} rev-parse HEAD")
     assert sha1 != sha0
     tree_sha = ssh(f"git -C {RUNS}/trees/{a} rev-parse HEAD")
