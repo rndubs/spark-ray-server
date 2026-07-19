@@ -57,8 +57,19 @@ def cmd_submit(args, ccfg) -> int:
         k, _, v = kv.partition("=")
         spec.setdefault("env", {})[k] = v
 
+    # dashboard contract (job-metadata contract in planning/DASHBOARD_SPEC.md)
+    dash = spec.get("dashboard") or {}
+    if args.desc: dash["desc"] = args.desc
+    if args.variant: dash["variant"] = args.variant
+    if args.seed: dash["seeds"] = args.seed
+    if args.input: dash["declared_inputs"] = args.input
+    if args.metrics: dash["metrics_path"] = args.metrics
+
     if not spec.get("name") or not spec.get("cmd"):
         sys.exit("submit needs at least --name and --cmd (or a --spec file with them)")
+    if not dash.get("desc"):
+        sys.exit('submit needs --desc "one line" (what is this job? shown on the '
+                 "dashboard and copied into the LEDGER)")
     spec.setdefault("repo_path", ccfg["default_repo"])
     spec.setdefault("ref", "HEAD")
     spec.setdefault("keep_tree_on_failure", True)
@@ -81,11 +92,29 @@ def cmd_submit(args, ccfg) -> int:
     )
     spec["sha"] = res.stdout.strip()
     spec["run_id"] = _run_id(spec["name"])
+
+    # branch + dirty flag of the Spark checkout at submit time. NB: the job
+    # runs from a clean worktree at the SHA, so a dirty checkout is NOT in
+    # the run — the badge means "uncommitted work existed that this run does
+    # not include".
+    res = tunnel.ssh_run(
+        ccfg["host"],
+        f"git -C {shlex.quote(spec['repo_path'])} rev-parse --abbrev-ref "
+        f"{shlex.quote(spec['ref'])}; "
+        f"git -C {shlex.quote(spec['repo_path'])} status --porcelain -uno | head -1",
+        check=False,
+    )
+    lines = res.stdout.splitlines()
+    branch = lines[0].strip() if lines else ""
+    dash["branch"] = spec["ref"] if branch in ("", "HEAD", spec["sha"]) else branch
+    dash["dirty"] = len(lines) > 1 and bool(lines[1].strip())
+    dash["submitted_ts"] = ledger.utc_ts()
     spec.pop("ref", None)
+    spec["dashboard"] = dash
 
     driver_spec = {k: spec.get(k) for k in (
         "run_id", "name", "repo_path", "sha", "cmd", "env", "mem_gb",
-        "artifacts_dir", "timeout_s", "keep_tree_on_failure")}
+        "artifacts_dir", "timeout_s", "keep_tree_on_failure", "dashboard")}
     b64 = base64.b64encode(json.dumps(driver_spec).encode()).decode()
     entrypoint = (
         f"{ccfg['orchestrator_root']}/.venv/bin/python -m spark_orchestrator.driver {b64}"
@@ -96,7 +125,10 @@ def cmd_submit(args, ccfg) -> int:
         submission_id=spec["run_id"],
         entrypoint_resources={"mem_gb": spec["mem_gb"]},
         metadata={"name": spec["name"], "sha": spec["sha"],
-                  "mem_gb": str(spec["mem_gb"])},
+                  "mem_gb": str(spec["mem_gb"]),
+                  "desc": dash["desc"][:200],
+                  "branch": dash["branch"], "dirty": "1" if dash["dirty"] else "0",
+                  **({"variant": dash["variant"]} if dash.get("variant") else {})},
     )
     print(spec["run_id"])
     if args.wait:
@@ -211,6 +243,18 @@ def cmd_gc(args, ccfg) -> int:
     return res.returncode
 
 
+def cmd_dashboard(args, ccfg) -> int:
+    port = ccfg.get("dashboard_local_port", 8787)
+    tunnel.ensure_forward(
+        ccfg["host"], port, ccfg.get("dashboard_remote_port", 8787), "/api/host"
+    )
+    url = f"http://127.0.0.1:{port}"
+    print(url)
+    if args.open:
+        subprocess.call(["open", url])
+    return 0
+
+
 def cmd_doctor(args, ccfg) -> int:
     ok = True
 
@@ -231,6 +275,9 @@ def cmd_doctor(args, ccfg) -> int:
     check("tunnel + Ray jobs API", _tun)
     check("spark-ray.service active", lambda: tunnel.ssh_run(
         ccfg["host"], "systemctl --user is-active spark-ray.service").stdout.strip())
+    check("spark-dashboard.service active", lambda: tunnel.ssh_run(
+        ccfg["host"], "systemctl --user is-active spark-dashboard.service",
+        check=False).stdout.strip() or "inactive")
     def _cap():
         cap = _remote_capacity(ccfg)
         if cap["schedulable_mem_gb"] <= 0:
@@ -275,6 +322,16 @@ def main() -> None:
     s.add_argument("--no-keep-tree", action="store_true",
                    help="remove worktree even on failure")
     s.add_argument("--wait", action="store_true")
+    s.add_argument("--desc", help="required one-line description (dashboard + LEDGER)")
+    s.add_argument("--variant", help="model/config variant name (dashboard)")
+    s.add_argument("--seed", action="append", metavar="N",
+                   help="seed(s) used by the job (repeatable)")
+    s.add_argument("--input", action="append", metavar="PATH", dest="input",
+                   help="declared input path the job reads (dir granularity, "
+                        "repeatable; contamination-checked against eval/frozen)")
+    s.add_argument("--metrics", metavar="PATH",
+                   help="where the job writes metrics.jsonl (absolute, or "
+                        "relative to the artifacts dir)")
     s.set_defaults(fn=cmd_submit)
 
     s = sub.add_parser("status", help="one job, or running/queued + capacity")
@@ -299,6 +356,10 @@ def main() -> None:
     s.add_argument("--dry-run", action="store_true")
     s.add_argument("--force-started", action="store_true")
     s.set_defaults(fn=cmd_gc)
+
+    s = sub.add_parser("dashboard", help="tunnel to the training dashboard + print URL")
+    s.add_argument("--open", action="store_true", help="also open it in the browser")
+    s.set_defaults(fn=cmd_dashboard)
 
     s = sub.add_parser("doctor", help="triage checks")
     s.set_defaults(fn=cmd_doctor)

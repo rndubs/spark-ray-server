@@ -1,0 +1,15 @@
+[Unit]
+Description=Spark training dashboard (read-only, 127.0.0.1 only)
+After=network.target
+# Observes the Ray head but does not require it — the dashboard renders
+# "Ray down" and sidecar-only history when spark-ray is stopped.
+Wants=spark-ray.service
+
+[Service]
+Type=exec
+ExecStart=%h/spark-orchestrator/.venv/bin/spark-dashboard
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

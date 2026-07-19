@@ -30,6 +30,28 @@ runs_root = "/home/rwhit/spark-runs"
 [gc]
 failed_tree_ttl_days = 7
 
+# Training dashboard (spark-dashboard.service). Read-only overlay on Ray:
+# per-job provenance, curves, data-audit, GPU-hours. Bound to 127.0.0.1 —
+# reach it over the tunnel `sparkctl dashboard` opens (localhost:8787).
+[dashboard]
+bind = "127.0.0.1"        # localhost ONLY — startup refuses anything else
+port = 8787
+ray_port = 8265           # Ray Jobs API the dashboard reads (loopback)
+data_root = "/data/hexforge-data"   # DATA.md tree root, for tier tagging
+disk_watch = "/data"      # disk-free shown in the host strip
+stall_threshold_s = 600   # RUNNING with no output this long -> STALLED
+history_depth = 50        # completed-jobs table depth (scans run-dir sidecars)
+# Poll cadences (seconds); defaults match the spec.
+poll_ray_s = 2
+poll_host_s = 2
+poll_metrics_s = 5
+poll_fd_s = 30
+poll_sidecar_s = 60
+# hexgen adapter: metrics file + the loss columns plotted/summarised by
+# default. A second training track sets its own here without touching core.
+metrics_filename = "metrics.jsonl"
+loss_keys = ["train_total", "holdout_total"]
+
 # Gitignored assets symlinked from the main checkout into each pinned
 # worktree (contract §5.4: config, not code). Paths that exist as tracked
 # dirs in the tree get their missing entries linked one level down.

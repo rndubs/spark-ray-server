@@ -34,36 +34,41 @@ def ssh_run(host: str, remote_cmd: str, check: bool = True,
     return res
 
 
-def api_alive(port: int, timeout: float = 1.5) -> bool:
+def api_alive(port: int, path: str = "/api/version", timeout: float = 1.5) -> bool:
     try:
         with urllib.request.urlopen(
-            f"http://127.0.0.1:{port}/api/version", timeout=timeout
+            f"http://127.0.0.1:{port}{path}", timeout=timeout
         ) as r:
             return r.status == 200
     except Exception:
         return False
 
 
-def ensure_tunnel(client_cfg: dict) -> None:
-    port = client_cfg["local_port"]
-    if api_alive(port):
+def ensure_forward(host: str, local_port: int, remote_port: int,
+                   probe_path: str = "/api/version") -> None:
+    if api_alive(local_port, probe_path):
         return
     Path("~/.ssh").expanduser().mkdir(mode=0o700, exist_ok=True)
     cmd = ssh_cmd(
-        client_cfg["host"],
+        host,
         "-f", "-N",
         "-o", "ExitOnForwardFailure=yes",
-        "-L", f"{port}:127.0.0.1:{client_cfg['remote_port']}",
+        "-L", f"{local_port}:127.0.0.1:{remote_port}",
     )
     res = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
     if res.returncode != 0:
         raise RuntimeError(f"ssh tunnel failed: {res.stderr.strip()}")
     for _ in range(20):
-        if api_alive(port):
+        if api_alive(local_port, probe_path):
             return
         import time
         time.sleep(0.25)
     raise RuntimeError(
-        f"tunnel is up but Ray jobs API on 127.0.0.1:{port} is not responding "
-        f"(is spark-ray.service running? try: sparkctl doctor)"
+        f"tunnel is up but nothing answers on 127.0.0.1:{local_port}{probe_path} "
+        f"(is the service running on the Spark? try: sparkctl doctor)"
     )
+
+
+def ensure_tunnel(client_cfg: dict) -> None:
+    ensure_forward(client_cfg["host"], client_cfg["local_port"],
+                   client_cfg["remote_port"])

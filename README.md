@@ -72,6 +72,27 @@ vllm_reserve`. When you bring the operator vLLM server up or down, edit
 jobs running). Budgets in `[budgets]` are measured, not guessed — remeasure
 when a workload changes materially.
 
+## Training dashboard
+
+A read-only, localhost-only web overlay (`spark-dashboard.service`, port 8787)
+answers per training job: what's running, on what code + data, how far along,
+how healthy, and its GPU-hours. It reads the Ray Jobs API, the `dashboard.json`
+sidecars `sparkctl submit` writes, and `metrics.jsonl` — never the Ray
+internals the 8265 dashboard already shows. Design: `planning/DASHBOARD_SPEC.md`;
+ops: `tools/dashboard/README.md`.
+
+```sh
+sparkctl dashboard                       # tunnel + print http://localhost:8787
+sparkctl submit --name sft --class hexgen-train-27m \
+  --desc "L3 P21 SFT baseline" --variant baseline --seed 0 \
+  --input /data/hexforge-data/corpora/p21_sft \
+  --cmd 'python hexgen/decoder/train.py --run-dir "$SPARK_ARTIFACTS_DIR" ...'
+```
+
+`--desc` is required (it's the row label + the copyable LEDGER line). `--input`
+paths are tier-tagged against `docs/DATA.md`; a declared or observed read under
+`eval/frozen/` raises the contamination badge.
+
 ## Ops / triage
 
 `sparkctl doctor` first. Service logs: `journalctl --user -u spark-ray
