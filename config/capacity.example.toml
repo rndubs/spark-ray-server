@@ -1,0 +1,41 @@
+# Capacity config for spark-orchestrator on the DGX Spark (GB10).
+# Install at ~/.config/spark-orchestrator/capacity.toml (preferred) or
+# /etc/spark-orchestrator/capacity.toml.
+#
+# schedulable_mem_gb is DERIVED: total - os_reserve - vllm_reserve.
+# These are declared budgets (bookkeeping, not enforcement) — measure, don't
+# guess. Restart spark-ray.service after changing reserves.
+
+# measured_on = 2026-07-18
+total_mem_gb = 121        # `free -g` total on the GB10
+os_reserve_gb = 9         # OS + dgx-dashboard + slack for Ray itself
+vllm_reserve_gb = 72      # operator vLLM at --gpu-memory-utilization 0.60
+                          # (0.60 x 121; `free` confirms ~43 GB left). Set 0
+                          # when the server is down.
+
+# Per-job-class default budgets (GB). Overridden per job with --mem-gb.
+# Measured during acceptance (spec §7.7); see measured_on comments.
+[budgets]
+default = 8
+hexgen-train-27m = 8      # placeholder — measured during acceptance gate 7
+hexgen-eval = 8           # placeholder — measured during acceptance gate 7
+
+[paths]
+runs_root = "/home/rwhit/spark-runs"
+
+[gc]
+failed_tree_ttl_days = 7
+
+# Gitignored assets symlinked from the main checkout into each pinned
+# worktree (contract §5.4: config, not code). Paths that exist as tracked
+# dirs in the tree get their missing entries linked one level down.
+[[repos]]
+path = "/home/rwhit/projection-meshing"
+symlink_assets = [
+  ".venv",
+  ".venv-train",
+  ".venv-serve",
+  "data/brepgraph",
+  "data/hexagent_traces",
+  "target/release",
+]

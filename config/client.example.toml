@@ -1,0 +1,9 @@
+# sparkctl client config — install at ~/.config/spark-orchestrator/client.toml
+# on the Mac. All values shown are the defaults; omit what you don't change.
+
+host = "rwhit"            # ssh host alias (ssh -4 is always used)
+local_port = 8265         # local end of the tunnel
+remote_port = 8265        # Ray dashboard/jobs API port on the Spark
+orchestrator_root = "/home/rwhit/spark-orchestrator"
+runs_root = "/home/rwhit/spark-runs"
+default_repo = "/home/rwhit/projection-meshing"

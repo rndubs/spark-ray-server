@@ -1,0 +1,14 @@
+[Unit]
+Description=Ray head for spark-orchestrator (127.0.0.1 only)
+After=network.target
+
+[Service]
+Type=exec
+ExecStart=%h/spark-orchestrator/.venv/bin/spark-ray-head
+ExecStopPost=%h/spark-orchestrator/.venv/bin/ray stop --force
+Restart=on-failure
+RestartSec=5
+Environment=RAY_USAGE_STATS_ENABLED=0
+
+[Install]
+WantedBy=default.target
