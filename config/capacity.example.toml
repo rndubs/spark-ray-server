@@ -14,11 +14,15 @@ vllm_reserve_gb = 72      # operator vLLM at --gpu-memory-utilization 0.60
                           # when the server is down.
 
 # Per-job-class default budgets (GB). Overridden per job with --mem-gb.
-# Measured during acceptance (spec §7.7); see measured_on comments.
+# Measured on the GB10 (measured_on = 2026-07-18, acceptance gate 7):
+# 500-step baseline train: peak RSS 2.9 GB, system-wide MemAvailable dip
+# 7.1 GB (CUDA context + unified GPU allocs live outside RSS); eval
+# (--n 32, 20-graph cap): peak RSS 1.6 GB, dip 3.1 GB. Budgets = dip +
+# headroom.
 [budgets]
 default = 8
-hexgen-train-27m = 8      # placeholder — measured during acceptance gate 7
-hexgen-eval = 8           # placeholder — measured during acceptance gate 7
+hexgen-train-27m = 10
+hexgen-eval = 6
 
 [paths]
 runs_root = "/home/rwhit/spark-runs"
