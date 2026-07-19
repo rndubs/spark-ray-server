@@ -43,6 +43,12 @@ job_class, artifacts_dir, timeout_s, keep_tree_on_failure}`. `ref` resolves
 to a SHA at submission; the SHA is what runs. Client config (optional):
 `config/client.example.toml` → `~/.config/spark-orchestrator/client.toml`.
 
+This layer is **not** hexgen-specific — any project on the Spark can use it.
+To wire in a new consumer repo (a `[[repos]]` block, budgets, the job
+contract, the dashboard metrics adapter), see `docs/CONSUMERS.md`. The
+`skills/spark-jobs` skill is the project-agnostic scheduling surface for use
+from other repos.
+
 Contract with the consumer repo (spec §5): the job is an arbitrary shell
 command run with `cwd` = the pinned worktree, caller env plus injected
 `SPARK_RUN_ID`, `SPARK_SHA`, `SPARK_ARTIFACTS_DIR`; success == exit 0; put
@@ -71,6 +77,27 @@ vllm_reserve`. When you bring the operator vLLM server up or down, edit
 `vllm_reserve_gb` and `systemctl --user restart spark-ray.service` (with no
 jobs running). Budgets in `[budgets]` are measured, not guessed — remeasure
 when a workload changes materially.
+
+## Training dashboard
+
+A read-only, localhost-only web overlay (`spark-dashboard.service`, port 8787)
+answers per training job: what's running, on what code + data, how far along,
+how healthy, and its GPU-hours. It reads the Ray Jobs API, the `dashboard.json`
+sidecars `sparkctl submit` writes, and `metrics.jsonl` — never the Ray
+internals the 8265 dashboard already shows. Design: `planning/DASHBOARD_SPEC.md`;
+ops: `tools/dashboard/README.md`.
+
+```sh
+sparkctl dashboard                       # tunnel + print http://localhost:8787
+sparkctl submit --name sft --class hexgen-train-27m \
+  --desc "L3 P21 SFT baseline" --variant baseline --seed 0 \
+  --input /data/hexforge-data/corpora/p21_sft \
+  --cmd 'python hexgen/decoder/train.py --run-dir "$SPARK_ARTIFACTS_DIR" ...'
+```
+
+`--desc` is required (it's the row label + the copyable LEDGER line). `--input`
+paths are tier-tagged against `docs/DATA.md`; a declared or observed read under
+`eval/frozen/` raises the contamination badge.
 
 ## Ops / triage
 

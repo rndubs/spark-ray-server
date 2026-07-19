@@ -27,7 +27,35 @@ from pathlib import Path
 
 from . import config, ledger, worktree
 
-_state = {"proc": None, "ended": False, "spec": None, "t0": 0.0, "cfg": None}
+_state = {"proc": None, "ended": False, "spec": None, "t0": 0.0, "cfg": None,
+          "sidecar": None, "run_dir": None}
+
+
+def _write_sidecar() -> None:
+    """Atomically (re)write the run dir's dashboard.json (the job-metadata
+    contract the training dashboard joins with Ray state by run_id)."""
+    doc, run_dir = _state["sidecar"], _state["run_dir"]
+    if doc is None or run_dir is None:
+        return
+    try:
+        tmp = run_dir / "dashboard.json.tmp"
+        tmp.write_text(json.dumps(doc, indent=2, sort_keys=True))
+        tmp.replace(run_dir / "dashboard.json")
+    except Exception as e:
+        print(f"[driver] sidecar write failed: {e}", file=sys.stderr)
+
+
+def _finalize_sidecar(status: str, exit_code: int | None) -> None:
+    doc = _state["sidecar"]
+    if doc is None:
+        return
+    doc["final"] = {
+        "status": status,
+        "exit_code": exit_code,
+        "duration_s": round(time.monotonic() - _state["t0"], 1),
+        "ended_ts": ledger.utc_ts(),
+    }
+    _write_sidecar()
 
 
 def _end_row(status: str, exit_code: int | None) -> dict:
@@ -52,6 +80,7 @@ def _on_sigterm(signum, frame):
         os._exit(143)
     _state["ended"] = True
     ledger.append(config.ledger_path(_state["cfg"]), _end_row("cancelled", None))
+    _finalize_sidecar("cancelled", None)
     proc = _state["proc"]
     if proc is not None and proc.poll() is None:
         try:
@@ -93,6 +122,28 @@ def main() -> int:
     repo = Path(spec["repo_path"]).expanduser()
     tree = config.trees_root(cfg) / spec["run_id"]
 
+    _state["run_dir"] = run_dir
+    _state["sidecar"] = {
+        "run_id": spec["run_id"],
+        "name": spec["name"],
+        "sha": spec["sha"],
+        "cmd": spec["cmd"],
+        "mem_gb": spec["mem_gb"],
+        "artifacts_dir": spec["artifacts_dir"],
+        "log_path": str(log_path),
+        "worktree": str(tree),
+        "repo_path": str(repo),
+        "registered": True,
+        **(spec.get("dashboard") or {}),
+        "started_ts": ledger.utc_ts(),
+        "pid": None,
+        "final": None,
+    }
+    mp = _state["sidecar"].get("metrics_path")
+    if mp and not os.path.isabs(mp):
+        _state["sidecar"]["metrics_path"] = str(Path(spec["artifacts_dir"]) / mp)
+    _write_sidecar()
+
     ledger.append(
         config.ledger_path(cfg),
         {
@@ -121,6 +172,7 @@ def main() -> int:
         print(f"[driver] setup failed: {e}", file=sys.stderr)
         _state["ended"] = True
         ledger.append(config.ledger_path(cfg), _end_row("failed", None))
+        _finalize_sidecar("failed", None)
         return 1
 
     env = dict(os.environ)
@@ -141,6 +193,8 @@ def main() -> int:
             start_new_session=True,
         )
         _state["proc"] = proc
+        _state["sidecar"]["pid"] = proc.pid
+        _write_sidecar()
         reader = threading.Thread(target=_tee, args=(proc.stdout, log_file), daemon=True)
         reader.start()
         try:
@@ -163,6 +217,7 @@ def main() -> int:
         return 143
     _state["ended"] = True
     ledger.append(config.ledger_path(cfg), _end_row(status, exit_code))
+    _finalize_sidecar(status, exit_code)
     print(f"[driver] {status} exit_code={exit_code}", file=sys.stderr)
 
     keep = spec.get("keep_tree_on_failure", True)

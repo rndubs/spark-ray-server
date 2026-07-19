@@ -10,6 +10,11 @@ dependencies = []
 [project.scripts]
 sparkctl = "spark_orchestrator.cli:main"
 spark-ray-head = "spark_orchestrator.head:main"
+spark-dashboard = "spark_orchestrator.dashboard.app:main"
+
+[project.optional-dependencies]
+# Installed only in the Spark server venv (the Mac client is stdlib-only).
+dashboard = ["fastapi", "uvicorn", "psutil"]
 
 [build-system]
 requires = ["hatchling"]

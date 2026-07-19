@@ -15,6 +15,8 @@ CLIENT_DEFAULTS = {
     "host": "rwhit",
     "local_port": 8265,
     "remote_port": 8265,
+    "dashboard_local_port": 8787,
+    "dashboard_remote_port": 8787,
     "orchestrator_root": "/home/rwhit/spark-orchestrator",
     "runs_root": "/home/rwhit/spark-runs",
     "default_repo": "/home/rwhit/projection-meshing",
