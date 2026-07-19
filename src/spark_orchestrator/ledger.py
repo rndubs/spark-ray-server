@@ -9,7 +9,9 @@ from pathlib import Path
 
 
 def utc_ts() -> str:
-    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    now = time.time()
+    ms = int((now % 1) * 1000)
+    return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(now)) + f".{ms:03d}Z"
 
 
 def append(path: Path, row: dict) -> None:
