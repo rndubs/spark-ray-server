@@ -43,6 +43,12 @@ job_class, artifacts_dir, timeout_s, keep_tree_on_failure}`. `ref` resolves
 to a SHA at submission; the SHA is what runs. Client config (optional):
 `config/client.example.toml` → `~/.config/spark-orchestrator/client.toml`.
 
+This layer is **not** hexgen-specific — any project on the Spark can use it.
+To wire in a new consumer repo (a `[[repos]]` block, budgets, the job
+contract, the dashboard metrics adapter), see `docs/CONSUMERS.md`. The
+`skills/spark-jobs` skill is the project-agnostic scheduling surface for use
+from other repos.
+
 Contract with the consumer repo (spec §5): the job is an arbitrary shell
 command run with `cwd` = the pinned worktree, caller env plus injected
 `SPARK_RUN_ID`, `SPARK_SHA`, `SPARK_ARTIFACTS_DIR`; success == exit 0; put
