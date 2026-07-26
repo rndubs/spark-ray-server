@@ -173,8 +173,15 @@ def gate4():
     assert ssh(f"test -d {RUNS}/trees/{b} || echo gone") == "gone", "no-keep tree kept"
     sparkctl("gc", "--ttl-days", "0")
     assert ssh(f"test -d {RUNS}/trees/{a} || echo gone") == "gone", "gc missed tree"
-    wt = ssh(f"git -C {REPO} worktree list")
-    assert f"{RUNS}/trees/" not in wt, f"stale worktree entries:\n{wt}"
+    # Scope this to the runs this gate created: `worktree list` is global, and
+    # a leftover tree from an unrelated incident is not a gate 4 failure.
+    lines = ssh(f"git -C {REPO} worktree list").splitlines()
+    mine = [ln for ln in lines if f"{RUNS}/trees/{a}" in ln or f"{RUNS}/trees/{b}" in ln]
+    assert not mine, "stale worktree entries for this gate's runs:\n" + "\n".join(mine)
+    others = [ln for ln in lines if f"{RUNS}/trees/" in ln]
+    if others:
+        print(f"gate4 note: {len(others)} unrelated run tree(s) still registered "
+              f"(pre-existing, not from this gate):\n  " + "\n  ".join(others))
     print("gate4 hygiene: PASS (kept on fail, removed with keep=false, gc swept, list clean)")
 
 

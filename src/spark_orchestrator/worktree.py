@@ -44,8 +44,24 @@ def symlink_assets(repo: Path, tree: Path, assets: list[str]) -> list[str]:
     return linked
 
 
-def remove(repo: Path, tree: Path) -> None:
-    _git(repo, "worktree", "remove", "--force", str(tree))
+def remove(repo: Path, tree: Path, allow_locked: bool = False) -> None:
+    """Remove a run worktree.
+
+    A tree git has locked (notably lock reason "initializing", left behind when
+    the head is killed mid `git worktree add`) refuses a plain --force remove.
+    Pass allow_locked=True only when the run is known not to be live — then we
+    unlock and retry with -f -f.
+    """
+    try:
+        _git(repo, "worktree", "remove", "--force", str(tree))
+    except RuntimeError:
+        if not allow_locked:
+            raise
+        try:
+            _git(repo, "worktree", "unlock", str(tree))
+        except RuntimeError:
+            pass  # not locked after all; the -f -f retry reports the real cause
+        _git(repo, "worktree", "remove", "--force", "--force", str(tree))
     _git(repo, "worktree", "prune")
 
 
