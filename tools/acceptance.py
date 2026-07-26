@@ -57,7 +57,9 @@ CAPACITY = capacity()
 
 def submit(name, cmd, mem_gb, *extra):
     return sparkctl("submit", "--name", name, "--cmd", cmd,
-                    "--mem-gb", str(mem_gb), *extra).splitlines()[-1].strip()
+                    "--mem-gb", str(mem_gb),
+                    "--desc", f"acceptance {name} ({mem_gb} GB)",
+                    *extra).splitlines()[-1].strip()
 
 
 def ray_status(run_id):
