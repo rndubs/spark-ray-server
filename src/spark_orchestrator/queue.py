@@ -49,7 +49,14 @@ from . import config, ledger
 
 # Ledger statuses that mean "this run is over"; nothing further will be
 # written for it. Kept in sync with gc.TERMINAL.
-TERMINAL = {"succeeded", "failed", "cancelled", "timeout", "lost"}
+#
+# `oom_killed` is deliberately its own status rather than a flavour of
+# `failed`/`lost`: it is the one terminal cause the submitter can fix by
+# changing a number (--mem-gb), and it must not be confused with `timeout`
+# (both arrive as SIGKILL) or with `lost` (which means the run vanished
+# without accounting for itself — the opposite of this, which is the
+# scheduler killing a job on purpose and saying so).
+TERMINAL = {"succeeded", "failed", "cancelled", "timeout", "lost", "oom_killed"}
 
 # A daemon loop is ~POLL_S; anything older than this means the admitter is
 # not running and queued work is not moving.

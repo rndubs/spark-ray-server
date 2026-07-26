@@ -33,8 +33,12 @@ memory budget and a pinned worktree.
 3. **JIT compiles eat tens of GB.** Triton/FlashInfer/nvcc fan out ~20
    compilers; cap with `MAX_JOBS=4` **inside** the job command and declare the
    spike in `mem_gb`.
-4. **Budgets are accounting, not enforcement** (no MIG/cgroups): a job that
-   lies about `mem_gb` can still OOM the box. Measure, then declare.
+4. **`mem_gb` is a hard cap, not a hint.** Each job runs in its own cgroup
+   with `MemoryMax` = the declared `mem_gb` and swap disabled, so a job that
+   goes over is killed on its own (ledger status `oom_killed`, with the
+   measured peak on the row) instead of the kernel killing the biggest
+   process on the box. Measure, then declare — under-declaring now kills
+   your job, not the host. GPU memory is still unenforced (no MIG).
 
 ## The job contract
 

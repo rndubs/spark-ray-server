@@ -137,6 +137,10 @@ class Views:
             "reads": {"declared": [], "observed": [], "contaminated": False},
             "started_ts": None, "ended_ts": None,
             "queued_ts": entry.get("queued_ts"),
+            # Server-side nanosecond enqueue clock: the queue's own FIFO key.
+            # queued_ts is only millisecond-resolution, so two jobs submitted
+            # back-to-back tie and sort arbitrarily.
+            "queue_seq": entry.get("seq"),
         }
         if detail:
             row.update(sidecar={}, cmd=entry.get("cmd"), log_path=None,
@@ -301,7 +305,8 @@ class Views:
         terminal = [r for r in rows if r["status"] not in live + ("QUEUED",)]
         terminal.sort(key=lambda r: r.get("ended_ts") or "", reverse=True)
         active.sort(key=lambda r: r.get("started_ts") or "", reverse=True)
-        waiting.sort(key=lambda r: r.get("queued_ts") or "")
+        waiting.sort(key=lambda r: (r.get("queue_seq") or "",
+                                    r.get("queued_ts") or ""))
         return {"jobs": active + waiting + terminal[:10],
                 "generated_ts": time.time()}
 

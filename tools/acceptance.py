@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Acceptance gates 2-5 and 8 (spec §7), driven from the Mac via sparkctl.
+"""Acceptance gates 2-5, 8 and 9 (spec §7), driven from the Mac via sparkctl.
 
 Gate 1 (Ray aarch64) is checked at install; gate 6 (reboot survival) and
 gate 7 (real-workload budgets) are run manually — results for all gates are
@@ -225,8 +225,68 @@ def gate8():
           f"{CAPACITY:g} GB, {n} succeeded, 0 lost)")
 
 
+def gate9():
+    """Regression gate for the 2026-07-26 host-OOM incident.
+
+    A job declared 8 GB and used ~119 GB on a 121 GB box; the kernel killed
+    the biggest thing on the host — the Ray head — five separate times, each
+    one taking every other running job with it. The declaration was admission
+    bookkeeping that nothing enforced.
+
+    So: a job that deliberately over-allocates must die on its own, at its own
+    declared limit, with a terminal ledger row that says memory (not timeout,
+    not lost) — and the box, the head and a concurrent job must be untouched.
+    """
+    limit = 4                       # bounded on purpose: 4 GB of a 112 GB box
+    innocent = submit("gate9-innocent", "sleep 45", 2)
+    wait_status(innocent, {"RUNNING"})
+
+    # Bounded at 12 GB, not unbounded: if enforcement were broken this gate
+    # must waste a little memory, not repeat the incident it tests for.
+    hog = ("python3 -u -c '\n"
+           "b = []\n"
+           "for i in range(24):\n"
+           "    b.append(bytearray(512 * 1024 * 1024))\n"
+           "    print(len(b) // 2, \"GB\")\n"
+           "'")
+    a = submit("gate9-oom", hog, limit)
+    wait_status(a, {"FAILED"}, timeout=300)
+    row = end_row(a)
+    assert row["status"] == "oom_killed", \
+        f"memory kill must not be reported as {row['status']!r}: {row}"
+    assert row["mem_enforced"] is True, row
+    assert row["mem_limit_gb"] == float(limit), row
+    # oom_kill_count / mem_peak_gb are polled samples: a job that dies inside
+    # one poll interval legitimately reports 0 / None, and the status comes
+    # from systemd's own Result. So assert they are CONSISTENT, not present.
+    assert (row["mem_peak_gb"] or 0) <= limit + 0.5, \
+        f"job exceeded its cap before dying: {row}"
+    assert "exceeded its declared memory" in (row.get("reason") or ""), row
+
+    # the whole point: nothing else noticed
+    assert ray_status(innocent) in ("RUNNING", "SUCCEEDED"), \
+        "concurrent job died with the over-allocating one"
+    wait_status(innocent, {"SUCCEEDED"}, timeout=120)
+    assert end_row(innocent)["status"] == "succeeded"
+    assert ssh("systemctl --user is-active spark-ray.service") == "active", \
+        "the Ray head did not survive an over-allocating job"
+
+    # and a job that stays under its declaration is unaffected by the cap
+    b = submit("gate9-under",
+               "python3 -c \"a=bytearray(1024**3); print(len(a))\"", 4)
+    wait_status(b, {"SUCCEEDED"}, timeout=300)
+    brow = end_row(b)
+    assert brow["status"] == "succeeded" and brow["exit_code"] == 0, brow
+    assert brow["mem_enforced"] is True, brow
+
+    print(f"gate9 memory enforcement: PASS (oom_killed at {row['mem_limit_gb']:g} GB, "
+          f"sampled peak {row['mem_peak_gb']} GB, head + concurrent job "
+          f"survived, under-budget 1 GB job succeeded)")
+
+
 if __name__ == "__main__":
-    gates = sys.argv[1:] or ["2", "3", "4", "5", "8"]
+    gates = sys.argv[1:] or ["2", "3", "4", "5", "8", "9"]
     for g in gates:
-        {"2": gate2, "3": gate3, "4": gate4, "5": gate5, "8": gate8}[g]()
+        {"2": gate2, "3": gate3, "4": gate4, "5": gate5, "8": gate8,
+         "9": gate9}[g]()
     print("all requested gates passed")

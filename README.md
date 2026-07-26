@@ -2,9 +2,10 @@
 
 Ray-based job scheduling for the DGX Spark (GB10, aarch64, ~121 GB unified
 memory). Spec: `planning/SPARK_ORCHESTRATOR_SPEC.md`. Two jobs it exists to
-do: honest declared-memory accounting (jobs declare `mem_gb`; the scheduler
-refuses to co-schedule past capacity) and SHA-pinned worktrees (a push to the
-consumer repo never changes code under a running job).
+do: enforced declared-memory budgets (jobs declare `mem_gb`; the scheduler
+refuses to co-schedule past capacity **and** caps each job's cgroup at its
+declaration, so an over-allocating job dies alone) and SHA-pinned worktrees
+(a push to the consumer repo never changes code under a running job).
 
 ```
 Mac: sparkctl ──ssh -4 tunnel──► Ray Jobs API (127.0.0.1:8265, Spark)
@@ -162,9 +163,10 @@ Platform footguns (learned the hard way; do not re-litigate):
 Failure modes worth knowing: a driver SIGKILLed before writing its end row
 leaves a dangling `started` ledger row — Ray's job status (`sparkctl status
 <run_id>`) is the truth for liveness, and `sparkctl gc --force-started`
-sweeps such trees once expired. Memory budgets are accounting, not
-enforcement (no MIG/cgroups in v1): a job that lies about `mem_gb` can still
-OOM the box; measure before you declare.
+sweeps such trees once expired. `mem_gb` is enforced with a per-job cgroup
+(`MemoryMax` = the declaration, `MemorySwapMax=0`), so an over-allocating job
+is killed alone and gets an `oom_killed` ledger row carrying its measured
+peak; GPU memory is still unenforced (no MIG), so VRAM is shared on trust.
 
 ## Acceptance status (spec §7)
 

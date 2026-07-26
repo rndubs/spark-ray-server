@@ -11,6 +11,14 @@ Cancellation: `ray job stop` sends SIGTERM with a short grace before
 SIGKILL, so the handler writes the cancelled ledger row immediately, then
 kills the job's process group and exits. Worktree cleanup after cancel is
 left to `sparkctl gc`.
+
+Memory: the job command (not this driver) runs inside its own transient
+systemd scope capped at the declared `mem_gb`, so a job that blows past its
+declaration is killed on its own instead of the kernel picking the biggest
+process on the host — which on 2026-07-26 was the Ray head, five times, each
+time taking every other running job down with it. See memguard.py. The
+driver stays outside the scope so it survives the kill and can write the
+terminal `oom_killed` row.
 """
 
 from __future__ import annotations
@@ -25,10 +33,10 @@ import threading
 import time
 from pathlib import Path
 
-from . import config, ledger, worktree
+from . import config, ledger, memguard, worktree
 
 _state = {"proc": None, "ended": False, "spec": None, "t0": 0.0, "cfg": None,
-          "sidecar": None, "run_dir": None}
+          "sidecar": None, "run_dir": None, "guard": None}
 
 
 def _write_sidecar() -> None:
@@ -55,12 +63,16 @@ def _finalize_sidecar(status: str, exit_code: int | None) -> None:
         "duration_s": round(time.monotonic() - _state["t0"], 1),
         "ended_ts": ledger.utc_ts(),
     }
+    guard = _state["guard"]
+    if guard is not None:
+        doc.update(guard.verdict())   # incl. measured peak, for the dashboard
     _write_sidecar()
 
 
-def _end_row(status: str, exit_code: int | None) -> dict:
+def _end_row(status: str, exit_code: int | None, **extra) -> dict:
     spec, cfg = _state["spec"], _state["cfg"]
-    return {
+    guard = _state["guard"]
+    row = {
         "ts": ledger.utc_ts(),
         "run_id": spec["run_id"],
         "name": spec["name"],
@@ -73,6 +85,11 @@ def _end_row(status: str, exit_code: int | None) -> dict:
         "artifacts_dir": spec["artifacts_dir"],
         "log_path": spec["log_path"],
     }
+    if guard is not None:
+        row.update(guard.verdict())
+        row.pop("oom_killed", None)  # carried by `status`, not duplicated
+    row.update(extra)
+    return row
 
 
 def _on_sigterm(signum, frame):
@@ -93,6 +110,9 @@ def _on_sigterm(signum, frame):
                 os.killpg(proc.pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
+    guard = _state["guard"]
+    if guard is not None:
+        guard.stop_scope()   # anything that escaped the process group
     os._exit(143)
 
 
@@ -175,6 +195,26 @@ def main() -> int:
         _finalize_sidecar("failed", None)
         return 1
 
+    # Per-job memory cap. Set up after the worktree so a setup failure is not
+    # attributed to enforcement, and before anything of the job runs.
+    opts = memguard.options(cfg)
+    skip = None
+    if opts["enabled"]:
+        skip = memguard.probe(os.environ)
+        if skip:
+            # Loud, and recorded on the row: an unenforced job must never look
+            # like an enforced one.
+            print(f"[driver] WARNING: memory enforcement UNAVAILABLE ({skip}) — "
+                  f"this job runs uncapped and can take the host down",
+                  file=sys.stderr)
+    guard = memguard.Guard(spec["run_id"], spec["mem_gb"], opts, reason=skip)
+    _state["guard"] = guard
+    if guard.active:
+        print(f"[driver] mem cap {guard.limit_gb:g} GB (declared "
+              f"{spec['mem_gb']:g}), swap 0, scope {guard.unit}", file=sys.stderr)
+    _state["sidecar"].update(guard.verdict())
+    _write_sidecar()
+
     env = dict(os.environ)
     env.update(spec.get("env") or {})
     env["SPARK_RUN_ID"] = spec["run_id"]
@@ -185,14 +225,15 @@ def main() -> int:
     status, exit_code = "succeeded", 0
     with open(log_path, "wb") as log_file:
         proc = subprocess.Popen(
-            ["bash", "-c", spec["cmd"]],
+            guard.wrap(["bash", "-c", spec["cmd"]]),
             cwd=tree,
-            env=env,
+            env=guard.env(env),
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             start_new_session=True,
         )
         _state["proc"] = proc
+        guard.watch(proc)
         _state["sidecar"]["pid"] = proc.pid
         _write_sidecar()
         reader = threading.Thread(target=_tee, args=(proc.stdout, log_file), daemon=True)
@@ -213,10 +254,22 @@ def main() -> int:
                 pass
         reader.join(timeout=5)
 
+    # A cgroup memory kill is SIGKILL, i.e. exit 137 / rc -9 — indistinguishable
+    # from the timeout kill above by exit code alone, and consumers already read
+    # -9 as "timed out". So never infer it: `finish()` asks the cgroup's
+    # oom_kill counter and systemd's own Result for the scope. `timeout` still
+    # wins when we are the ones who did the killing.
+    extra = {}
+    guard.finish()
+    if status != "timeout" and guard.oom_killed:
+        status = "oom_killed"
+        extra["reason"] = guard.oom_reason()
+        print(f"[driver] OOM: {extra['reason']}", file=sys.stderr)
+
     if _state["ended"]:  # cancelled via SIGTERM; handler wrote the row
         return 143
     _state["ended"] = True
-    ledger.append(config.ledger_path(cfg), _end_row(status, exit_code))
+    ledger.append(config.ledger_path(cfg), _end_row(status, exit_code, **extra))
     _finalize_sidecar(status, exit_code)
     print(f"[driver] {status} exit_code={exit_code}", file=sys.stderr)
 
