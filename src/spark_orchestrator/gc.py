@@ -9,6 +9,9 @@ Sweeps trees under <runs_root>/trees:
 - runs still marked `started` are left alone (they may be live; a dead
   driver's tree ages out once its row is superseded or the TTL passes with
   --force-started).
+A tree git has locked (lock reason "initializing" is left behind when the head
+is killed mid `git worktree add`) is unlocked and force-removed only when the
+run is known not to be live: a terminal row, or `started` with --force-started.
 Then prunes worktree metadata in every affected repo.
 """
 
@@ -45,12 +48,17 @@ def sweep(cfg: dict, ttl_days: float, dry_run: bool, force_started: bool) -> dic
             kept.append((tree.name, status or "orphan"))
             continue
         repo = worktree.parent_repo_of(tree)
+        # A git lock ("initializing" after a head kill mid worktree-add) blocks
+        # a plain --force remove. Override it only where the run is known not to
+        # be live: a terminal ledger row, or `started` the operator explicitly
+        # forced. Orphans (no row at all) keep respecting the lock.
+        allow_locked = status in TERMINAL or (status == "started" and force_started)
         if dry_run:
             removed.append(tree.name)
             continue
         try:
             if repo is not None:
-                worktree.remove(repo, tree)
+                worktree.remove(repo, tree, allow_locked=allow_locked)
                 repos.add(repo)
             else:
                 import shutil
@@ -58,6 +66,10 @@ def sweep(cfg: dict, ttl_days: float, dry_run: bool, force_started: bool) -> dic
             removed.append(tree.name)
         except Exception as e:
             print(f"[gc] failed to remove {tree}: {e}", file=sys.stderr)
+            if "locked working tree" in str(e):
+                print(f"[gc]   locked and not known-dead ({status or 'orphan'}); "
+                      f"unlock it by hand once you are sure nothing is using it: "
+                      f"git -C {repo} worktree unlock {tree}", file=sys.stderr)
     for repo in repos:
         try:
             worktree._git(Path(repo), "worktree", "prune")
