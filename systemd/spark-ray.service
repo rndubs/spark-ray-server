@@ -9,6 +9,15 @@ ExecStopPost=%h/spark-orchestrator/.venv/bin/ray stop --force
 Restart=on-failure
 RestartSec=5
 Environment=RAY_USAGE_STATS_ENABLED=0
+# Defence in depth behind spark-admit. Ray fails any job that stays PENDING
+# longer than this (default 900 s) *before* our driver runs, so the job leaves
+# no ledger row, no run dir and no log — it looks unsubmitted rather than
+# failed. spark-admit now only hands Ray a job once its memory is free, so a
+# job should never sit PENDING for long; this raises the blast radius of that
+# invariant being wrong from "silent data loss" to "a job waits a while".
+# Takes effect on the next head restart, which kills running jobs — do not
+# restart spark-ray to pick this up while a campaign is in flight.
+Environment=RAY_JOB_START_TIMEOUT_SECONDS=86400
 
 [Install]
 WantedBy=default.target

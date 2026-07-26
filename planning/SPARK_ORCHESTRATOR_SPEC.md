@@ -83,10 +83,24 @@ sparkctl submit/status/logs/cancel ──► Ray Jobs API (127.0.0.1:8265, via S
   `.venv-train`, `.venv-serve`, `data/brepgraph`'s gitignored emits,
   `data/hexagent_traces`, `target/release`); worktree removed on success,
   kept on failure with a TTL sweep (`sparkctl gc`, default 7 days).
+- **Admission queue** (added 2026-07-26, after the incident below):
+  submissions land in `~/spark-runs/queue/pending` and the `spark-admit`
+  user unit hands them to Ray strictly FIFO, only once the declared `mem_gb`
+  is free; the entry moves to `queue/admitted` and is watched until the run's
+  ledger row is terminal. **Nothing queues inside Ray.** Ray fails any job
+  that stays PENDING past `RAY_JOB_START_TIMEOUT_SECONDS` (default 900 s) and
+  it does so before the driver runs, producing no ledger row, no run dir and
+  no log — on 2026-07-25 that silently destroyed 78 of 96 submitted shards.
+  The same daemon reconciles: any admitted run Ray finishes with (or forgets)
+  that never wrote a terminal row gets a `lost` row carrying the reason.
+  **Invariant: a run may fail, but it may not vanish.** Clients therefore do
+  not pace submissions; submitting 500 jobs at once is correct usage.
 - **Ledger**: append-only JSONL (one fixed path, e.g.
-  `~/spark-runs/ledger.jsonl`). Two rows per job (start, end):
-  `{ts, run_id, name, sha, cmd, mem_gb, status: started|succeeded|failed|
-  cancelled|timeout, exit_code, duration_s, artifacts_dir, log_path}`.
+  `~/spark-runs/ledger.jsonl`). Three rows per job (queued, start, end):
+  `{ts, run_id, name, sha, cmd, mem_gb, status: queued|started|succeeded|
+  failed|cancelled|timeout|lost, exit_code, duration_s, reason,
+  artifacts_dir, log_path}`. A `queued` row is written by `submit` itself, so
+  a run is visible from the moment the client's command returns.
   Never rewritten, never sorted, no other process writes it.
 - **Logs**: per-job file `~/spark-runs/<run_id>/job.log` (stdout+stderr
   merged), path in the ledger row. `sparkctl logs <run_id> [-f]` streams it.
@@ -106,6 +120,10 @@ load-bearing) with control-master reuse so repeated commands don't re-dial.
 
 - `spark-ray.service` (user unit, `loginctl enable-linger rwhit`): starts the
   Ray head with the capacity resources; restarts on failure; survives reboot.
+- `spark-admit.service` (user unit): the admission controller above. Holds no
+  job state in memory — the queue is on disk — so it is safe to restart at any
+  time, including mid-campaign. If it is down, queued jobs simply wait, and
+  `sparkctl status`/`doctor` say so explicitly.
 - `sparkctl doctor` is the first triage step, and the README documents the
   three known platform footguns: (1) uv-managed pythons only (headers), (2)
   `ssh -4` everywhere, (3) JIT compiles (Triton/FlashInfer/nvcc) can eat tens

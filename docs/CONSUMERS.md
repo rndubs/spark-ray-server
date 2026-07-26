@@ -87,6 +87,27 @@ sparkctl dashboard --open    # the training dashboard for all of it
 against the DATA.md tree (below); everything else is optional metadata that
 enriches the dashboard row.
 
+### Fleets: submit everything at once, don't pace it
+
+Submitting 500 jobs to a box that fits 14 is fine and expected. `submit`
+enqueues into the orchestrator's own durable queue on the Spark; the
+`spark-admit` daemon hands jobs to Ray strictly FIFO, only as memory frees up.
+Clients need no in-flight cap, no `status`-polling loop and no sleep between
+submits.
+
+The guarantee that makes that safe: **a job that cannot start yet never
+disappears.** `submit` writes a `queued` ledger row before it returns, so the
+run is visible to `sparkctl list` / `status` (with queue position) from that
+moment, and every run reaches a terminal status — `succeeded`, `failed`,
+`cancelled`, `timeout`, or `lost`. `lost` means something killed the run
+without it writing its own row; the row carries the reason. Silence is not a
+possible outcome.
+
+(Before 2026-07-26 this was not true: `submit` POSTed straight to Ray, and Ray
+killed jobs that sat queued past its 900 s job-supervisor start timeout with no
+ledger row and no output at all. Client-side pacing loops written against that
+behaviour are now redundant.)
+
 ## 4. Make your runs render on the dashboard
 
 The dashboard joins Ray state with the `dashboard.json` sidecar `sparkctl`

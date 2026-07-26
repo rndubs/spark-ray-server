@@ -27,6 +27,20 @@ def _remote_capacity(ccfg: dict) -> dict:
     return config.load_capacity(text=res.stdout)
 
 
+def _server(ccfg: dict, argv: str, check: bool = True):
+    """Run a spark_orchestrator server-side module on the Spark."""
+    return tunnel.ssh_run(
+        ccfg["host"],
+        f"{ccfg['orchestrator_root']}/.venv/bin/python -m spark_orchestrator.{argv}",
+        check=check,
+    )
+
+
+def _queue_state(ccfg: dict) -> dict:
+    """Capacity + admission-queue state in one round trip."""
+    return json.loads(_server(ccfg, "queue state").stdout)
+
+
 def _jobs(ccfg: dict) -> RayJobs:
     tunnel.ensure_tunnel(ccfg)
     return RayJobs(ccfg["local_port"])
@@ -119,27 +133,50 @@ def cmd_submit(args, ccfg) -> int:
     entrypoint = (
         f"{ccfg['orchestrator_root']}/.venv/bin/python -m spark_orchestrator.driver {b64}"
     )
-    jobs = _jobs(ccfg)
-    jobs.submit(
-        entrypoint=entrypoint,
-        submission_id=spec["run_id"],
-        entrypoint_resources={"mem_gb": spec["mem_gb"]},
-        metadata={"name": spec["name"], "sha": spec["sha"],
-                  "mem_gb": str(spec["mem_gb"]),
-                  "desc": dash["desc"][:200],
-                  "branch": dash["branch"], "dirty": "1" if dash["dirty"] else "0",
-                  **({"variant": dash["variant"]} if dash.get("variant") else {})},
-    )
+
+    # Enqueue with the orchestrator, do NOT submit to Ray. Ray fails any job
+    # that sits PENDING past its job-supervisor start timeout (900 s by
+    # default), and it does so before our driver runs — no ledger row, no run
+    # dir, no log. spark-admit hands this to Ray only once the memory is
+    # actually free, so it starts within seconds of being submitted and that
+    # timeout can never fire. See spark_orchestrator/queue.py.
+    entry = {
+        "run_id": spec["run_id"],
+        "name": spec["name"],
+        "sha": spec["sha"],
+        "cmd": spec["cmd"],
+        "mem_gb": spec["mem_gb"],
+        "entrypoint": entrypoint,
+        "metadata": {"name": spec["name"], "sha": spec["sha"],
+                     "mem_gb": str(spec["mem_gb"]),
+                     "desc": dash["desc"][:200],
+                     "branch": dash["branch"], "dirty": "1" if dash["dirty"] else "0",
+                     **({"variant": dash["variant"]} if dash.get("variant") else {})},
+    }
+    eb64 = base64.b64encode(json.dumps(entry).encode()).decode()
+    res = _server(ccfg, f"queue enqueue {eb64}")
+    sys.stderr.write(res.stderr)
     print(spec["run_id"])
     if args.wait:
-        return _wait(jobs, spec["run_id"])
+        return _wait(_jobs(ccfg), spec["run_id"])
     return 0
+
+
+def _ray_status(jobs: RayJobs, run_id: str) -> str | None:
+    """Ray's status for a run, or None while it is still in the orchestrator
+    queue and Ray has never heard of it."""
+    try:
+        return jobs.get(run_id)["status"]
+    except RuntimeError as e:
+        if "404" in str(e):
+            return None
+        raise
 
 
 def _wait(jobs: RayJobs, run_id: str) -> int:
     last = None
     while True:
-        st = jobs.get(run_id)["status"]
+        st = _ray_status(jobs, run_id) or "QUEUED"
         if st != last:
             print(f"[{time.strftime('%H:%M:%S')}] {st}", file=sys.stderr)
             last = st
@@ -153,36 +190,65 @@ def _wait(jobs: RayJobs, run_id: str) -> int:
 def cmd_status(args, ccfg) -> int:
     jobs = _jobs(ccfg)
     if args.run_id:
-        j = jobs.get(args.run_id)
+        st = _ray_status(jobs, args.run_id)
         print(f"run_id:  {args.run_id}")
-        print(f"ray:     {j['status']}  ({j.get('message') or ''})".rstrip())
-        for k in ("name", "sha", "mem_gb"):
-            if k in (j.get("metadata") or {}):
-                print(f"{k}:{' ' * (8 - len(k))}{j['metadata'][k]}")
+        if st is None:
+            qs = _queue_state(ccfg)
+            pos = next((i for i, e in enumerate(qs["pending"], 1)
+                        if e["run_id"] == args.run_id), None)
+            # Same `ray: <STATUS>` shape as a real Ray status so parsers (and
+            # eyes) get one vocabulary; QUEUED is not a Ray state, it means the
+            # orchestrator is holding the job and has not submitted it yet.
+            print("ray:     QUEUED  (held in the orchestrator queue, "
+                  "not yet submitted to Ray)")
+            if pos:
+                print(f"queue:   position {pos} of {len(qs['pending'])}")
+        else:
+            j = jobs.get(args.run_id)
+            print(f"ray:     {j['status']}  ({j.get('message') or ''})".rstrip())
+            for k in ("name", "sha", "mem_gb"):
+                if k in (j.get("metadata") or {}):
+                    print(f"{k}:{' ' * (8 - len(k))}{j['metadata'][k]}")
         res = tunnel.ssh_run(
             ccfg["host"],
             f"grep -F '\"run_id\":\"{args.run_id}\"' {ccfg['runs_root']}/ledger.jsonl || true",
         )
         for line in res.stdout.splitlines():
             row = json.loads(line)
-            extra = "" if row["status"] == "started" else (
+            extra = "" if row["status"] in ("started", "queued") else (
                 f" exit_code={row.get('exit_code')} duration_s={row.get('duration_s')}")
+            if row.get("reason"):
+                extra += f" reason={row['reason']!r}"
             print(f"ledger:  {row['ts']} {row['status']}{extra}")
         return 0
 
-    cap = _remote_capacity(ccfg)
+    qs = _queue_state(ccfg)
     active = [j for j in jobs.list() if j["status"] in ("PENDING", "RUNNING")]
-    used = sum(float((j.get("metadata") or {}).get("mem_gb", 0))
-               for j in active if j["status"] == "RUNNING")
-    sched = cap["schedulable_mem_gb"]
+    # Reserve against PENDING as well as RUNNING: a job Ray is still placing
+    # already owns its memory, and counting RUNNING alone (as this line used
+    # to) reports room that is not there.
+    used = sum(float((j.get("metadata") or {}).get("mem_gb", 0)) for j in active)
+    sched = qs["schedulable_mem_gb"]
+    pend = qs["pending"]
     print(f"capacity: {used:g}/{sched:g} GB reserved ({sched - used:g} free; "
-          f"vllm_reserve={cap['vllm_reserve_gb']:g}, config {cap['_path']})")
-    if not active:
+          f"vllm_reserve={qs['vllm_reserve_gb']:g}, config {qs['capacity_path']})")
+    print(f"queued:   {len(pend)} job(s) waiting for a slot"
+          + (f" ({sum(float(e['mem_gb']) for e in pend):g} GB)" if pend else ""))
+    if not qs["admitter_ok"]:
+        age = qs["heartbeat_age_s"]
+        print(f"WARNING:  spark-admit is not running "
+              f"({'never started' if age is None else f'heartbeat {age:.0f}s stale'})"
+              f" — queued jobs will not start. "
+              f"ssh {ccfg['host']} systemctl --user status spark-admit.service")
+    if not active and not pend:
         print("no running or queued jobs")
     for j in sorted(active, key=lambda j: j.get("submission_id") or ""):
         md = j.get("metadata") or {}
         print(f"  {j.get('submission_id'):44s} {j['status']:8s} "
               f"mem_gb={md.get('mem_gb', '?'):>5s} sha={md.get('sha', '?')[:12]}")
+    for i, e in enumerate(pend, 1):
+        print(f"  {e['run_id']:44s} {'QUEUED':8s} "
+              f"mem_gb={e['mem_gb']:>5g} sha={e['sha'][:12]} #{i}")
     return 0
 
 
@@ -196,8 +262,14 @@ def cmd_logs(args, ccfg) -> int:
 
 
 def cmd_cancel(args, ccfg) -> int:
-    jobs = _jobs(ccfg)
-    out = jobs.stop(args.run_id)
+    # A job still in the orchestrator queue has never reached Ray, so `ray job
+    # stop` would 404 on it. Drop it from the queue first (which writes its
+    # cancelled ledger row), and only fall through to Ray if it already ran.
+    res = _server(ccfg, f"queue cancel {shlex.quote(args.run_id)}", check=False)
+    if res.stdout.strip() == "cancelled":
+        print("cancelled while queued (never submitted to Ray)")
+        return 0
+    out = _jobs(ccfg).stop(args.run_id)
     print(f"stop requested: {out}")
     return 0
 
@@ -278,6 +350,19 @@ def cmd_doctor(args, ccfg) -> int:
     check("spark-dashboard.service active", lambda: tunnel.ssh_run(
         ccfg["host"], "systemctl --user is-active spark-dashboard.service",
         check=False).stdout.strip() or "inactive")
+    def _admit():
+        st = tunnel.ssh_run(ccfg["host"], "systemctl --user is-active spark-admit.service",
+                            check=False).stdout.strip() or "inactive"
+        qs = _queue_state(ccfg)
+        if st != "active" or not qs["admitter_ok"]:
+            age = qs["heartbeat_age_s"]
+            raise RuntimeError(
+                f"{st}, heartbeat "
+                f"{'never written' if age is None else f'{age:.0f}s stale'} — "
+                f"queued jobs will not start"
+            )
+        return f"{len(qs['pending'])} queued, heartbeat {qs['heartbeat_age_s']:.0f}s ago"
+    check("spark-admit.service admitting", _admit)
     def _cap():
         cap = _remote_capacity(ccfg)
         if cap["schedulable_mem_gb"] <= 0:

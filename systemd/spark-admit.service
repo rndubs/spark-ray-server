@@ -1,0 +1,16 @@
+[Unit]
+Description=Spark orchestrator admission controller (hands queued jobs to Ray)
+After=network.target spark-ray.service
+# Not Requires=: if the Ray head is down the admitter should stay up, keep the
+# queue on disk and admit nothing, rather than exit and leave submissions
+# piling up unattended.
+Wants=spark-ray.service
+
+[Service]
+Type=exec
+ExecStart=%h/spark-orchestrator/.venv/bin/spark-admit
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

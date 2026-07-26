@@ -29,6 +29,7 @@ import time
 import urllib.request
 from pathlib import Path
 
+from .. import queue
 from . import tiers
 
 RAY_TERMINAL = {"SUCCEEDED", "FAILED", "STOPPED"}
@@ -45,6 +46,7 @@ def _now() -> float:
 
 class Collector:
     def __init__(self, cfg: dict):
+        self.cfg = cfg
         d = cfg.get("dashboard", {})
         self.ray_port = int(d.get("ray_port", 8265))
         self.data_root = d.get("data_root", "/data/hexforge-data")
@@ -70,6 +72,10 @@ class Collector:
         # shared snapshot pieces
         self.host: dict = {}
         self.ray_jobs: dict[str, dict] = {}      # run_id -> ray job dict
+        # run_id -> queue entry, for jobs the orchestrator is holding and has
+        # not handed to Ray yet. Without this the dashboard would show 14
+        # running jobs and no hint that 82 more are waiting behind them.
+        self.queued: dict[str, dict] = {}
         self.sidecars: dict[str, dict] = {}       # run_id -> dashboard.json
         self.metrics: dict[str, dict] = {}        # run_id -> {path, rows, offset, inode, mtime}
         self.fd_reads: dict[str, dict] = {}       # run_id -> {observed:[{path,tier}], ts}
@@ -79,7 +85,7 @@ class Collector:
     # ---------------------------------------------------------------- lifecycle
     def start(self) -> None:
         self._poll_sidecars()   # warm the durable view before serving
-        self._poll_ray()
+        self._poll_ray_and_queue()
         self._poll_host()
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
@@ -89,7 +95,7 @@ class Collector:
 
     def _loop(self) -> None:
         pollers = {
-            "ray": self._poll_ray, "host": self._poll_host,
+            "ray": self._poll_ray_and_queue, "host": self._poll_host,
             "metrics": self._poll_metrics, "fd": self._poll_fd,
             "sidecar": self._poll_sidecars,
         }
@@ -105,6 +111,15 @@ class Collector:
             self._stop.wait(0.5)
 
     # ---------------------------------------------------------------- ray
+    def _poll_ray_and_queue(self) -> None:
+        """Ray state and the admission queue, refreshed together. The queue
+        read is local files and never fails on Ray being down, so it runs
+        even when _poll_ray bails."""
+        try:
+            self._poll_ray()
+        finally:
+            self._poll_queue()
+
     def _ray_get(self, path: str):
         with urllib.request.urlopen(
             f"http://127.0.0.1:{self.ray_port}{path}", timeout=5
@@ -139,6 +154,22 @@ class Collector:
             if doc is not None:
                 with self._lock:
                     self.sidecars[rid] = doc
+
+    def _poll_queue(self) -> None:
+        """Jobs waiting in the orchestrator's admission queue. Polled with the
+        Ray cadence: a queued job becomes a Ray job the moment a slot frees,
+        and the two views should not disagree for long."""
+        entries = {e["run_id"]: e for _, e in queue.pending(self.cfg)}
+        age = queue.heartbeat_age_s(self.cfg)
+        with self._lock:
+            self.queued = entries
+            self.host.setdefault("admit", {}).update(
+                pending=len(entries),
+                pending_mem_gb=round(sum(float(e.get("mem_gb") or 0)
+                                         for e in entries.values()), 1),
+                heartbeat_age_s=round(age) if age is not None else None,
+                up=age is not None and age <= queue.HEARTBEAT_STALE_S,
+            )
 
     def _read_sidecar(self, rid: str) -> dict | None:
         sc = self.runs_root / rid / "dashboard.json"

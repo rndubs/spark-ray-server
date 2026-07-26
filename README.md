@@ -17,7 +17,10 @@ Mac: sparkctl ──ssh -4 tunnel──► Ray Jobs API (127.0.0.1:8265, Spark)
   starts, `mem_gb` task schedules).
 - Server lives at `~/spark-orchestrator` on the Spark (this repo,
   push-to-deploy), venv `.venv` (uv-managed python 3.12).
-- Ledger: `~/spark-runs/ledger.jsonl` (append-only JSONL, two rows per job).
+- Ledger: `~/spark-runs/ledger.jsonl` (append-only JSONL; a `queued` row at
+  submit, a `started` row when the driver runs, one terminal row at the end).
+- Queue: `~/spark-runs/queue/{pending,admitted}` — submissions wait here, not
+  in Ray. See "Scheduling" below.
 - Logs: `~/spark-runs/<run_id>/job.log`; artifacts default to
   `~/spark-runs/<run_id>/artifacts` (survives worktree GC).
 - Worktrees: `~/spark-runs/trees/<run_id>`, removed on success, kept on
@@ -37,6 +40,32 @@ sparkctl cancel <run_id>
 sparkctl list
 sparkctl gc [--dry-run]
 ```
+
+### Scheduling
+
+Submit as many jobs as you like at once; **clients must not pace submissions.**
+`submit` enqueues into `~/spark-runs/queue/pending` on the Spark and returns.
+The `spark-admit` daemon hands a job to Ray strictly FIFO, and only once its
+declared `mem_gb` is actually free — so a job is PENDING inside Ray for
+seconds, not minutes.
+
+That matters because Ray fails any job that stays PENDING past its
+job-supervisor start timeout (`RAY_JOB_START_TIMEOUT_SECONDS`, default 900 s),
+and it does so *before* the driver runs: no ledger row, no run dir, no log. On
+2026-07-25 that silently destroyed 78 of 96 submitted shards. Two things now
+prevent a recurrence:
+
+1. Nothing queues inside Ray, so the timeout has nothing to fire on (and the
+   systemd unit raises it to 24 h as a backstop).
+2. A job is in the ledger from the instant `submit` returns (`queued`), and
+   every run reaches a terminal status. If a run dies without writing its own
+   terminal row, the admitter's reconciler writes a `lost` row with the reason.
+   **A run may fail; it may not vanish.**
+
+Admission is strict FIFO with head-of-line blocking — a small job never jumps
+ahead of a large one, so a large job cannot be starved. `sparkctl status` shows
+the queue and warns loudly if the admitter is not running; queued work is on
+disk and survives a daemon restart or a reboot.
 
 Job spec JSON (spec §2): `{name, repo_path, ref, cmd, env{}, mem_gb |
 job_class, artifacts_dir, timeout_s, keep_tree_on_failure}`. `ref` resolves
@@ -70,6 +99,12 @@ git remote add spark rwhit:spark-orchestrator
 
 Then every deploy is `tools/deploy.sh` (add `--restart` to bounce the Ray
 head — that kills running jobs, so by default it only starts it if down).
+`spark-dashboard` and `spark-admit` are always bounced: neither touches
+running jobs, and the admitter's queue is on disk, so restarting it mid-campaign
+costs at most a few seconds of admission latency.
+
+Three user units: `spark-ray.service` (the head), `spark-admit.service` (the
+admission controller — see Scheduling above), `spark-dashboard.service`.
 
 Capacity config: `~/.config/spark-orchestrator/capacity.toml` (see
 `config/capacity.example.toml`). `schedulable_mem_gb = total - os_reserve -
@@ -101,9 +136,15 @@ paths are tier-tagged against `docs/DATA.md`; a declared or observed read under
 
 ## Ops / triage
 
-`sparkctl doctor` first. Service logs: `journalctl --user -u spark-ray
--f` on the Spark. Ray dashboard: with the tunnel up (any sparkctl command
-opens it), http://127.0.0.1:8265.
+`sparkctl doctor` first. Service logs: `journalctl --user -u spark-ray -f`,
+`-u spark-admit -f`, `-u spark-dashboard -f` on the Spark. Ray dashboard: with
+the tunnel up (any sparkctl command opens it), http://127.0.0.1:8265.
+
+Offline tests (no Spark, no Ray — safe to run while a campaign is in flight):
+
+```sh
+python3 -m unittest discover -s tests -v
+```
 
 Platform footguns (learned the hard way; do not re-litigate):
 

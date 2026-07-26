@@ -69,6 +69,29 @@ sparkctl dashboard [--open]     # tunnel to the training dashboard, print URL
 submit (it could never run). Capacity = `total − os_reserve − vllm_reserve`
 (the vLLM reserve is the always-on operator server; 0 when down).
 
+## Submitting a fleet: do not pace it yourself
+
+**Submit everything at once.** The orchestrator holds what doesn't fit in its
+own durable queue (`~/spark-runs/queue`) and hands jobs to Ray strictly FIFO,
+one at a time, only as memory frees up. There is no submission rate a client
+needs to respect and no in-flight cap to enforce.
+
+Every submitted job has a ledger row from the instant `submit` returns:
+`queued` → `started` → terminal. `sparkctl list` and `sparkctl status` show
+queued jobs and their queue position, and `sparkctl cancel` works on a queued
+job just as it does on a running one. A job **cannot** be silently dropped:
+if anything kills a run without a terminal row, the admitter writes a `lost`
+row carrying the reason.
+
+Historical note for anyone reading old client code: before 2026-07-26,
+`sparkctl submit` POSTed straight to Ray, and Ray failed any job that sat
+queued past its 900 s job-supervisor start timeout — with no ledger row and no
+output, so it looked unsubmitted rather than failed. On 2026-07-25 that
+destroyed 78 of 96 shards in one campaign. Client-side pacing loops (e.g.
+`wait_for_room` in projection-meshing's `tools/run_bonanza_shards.sh`) were
+the workaround. They are now redundant and can be deleted; they are harmless
+if left in place.
+
 ## Onboarding a new repo (once)
 
 On the Spark, edit `~/.config/spark-orchestrator/capacity.toml`:
@@ -93,9 +116,16 @@ metrics streaming.
 
 ## Triage
 
-`sparkctl doctor` first (checks tunnel, Ray head, dashboard service, capacity
-sanity, ledger/worktree writability, repo reachability). Service logs on the
-Spark: `journalctl --user -u spark-ray -f` and `-u spark-dashboard -f`. A
+`sparkctl doctor` first (checks tunnel, Ray head, dashboard service, the
+admitter, capacity sanity, ledger/worktree writability, repo reachability).
+Service logs on the Spark: `journalctl --user -u spark-ray -f`,
+`-u spark-admit -f`, `-u spark-dashboard -f`.
+
+**Jobs stuck at `queued` and never starting** means the admitter is down —
+`sparkctl status` and `doctor` both say so explicitly. Nothing is lost (the
+queue is on disk); `systemctl --user restart spark-admit` drains it. Restarting
+the admitter is safe at any time, including mid-campaign: it holds no job state
+in memory and does not touch running jobs. A
 driver SIGKILLed before writing its end row leaves a dangling `started` ledger
 row — Ray job status (`sparkctl status <run_id>`) is the truth for liveness;
 `sparkctl gc --force-started` sweeps such trees once expired.

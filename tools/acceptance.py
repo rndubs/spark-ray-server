@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
-"""Acceptance gates 2-5 (spec §7), driven from the Mac via sparkctl.
+"""Acceptance gates 2-5 and 8 (spec §7), driven from the Mac via sparkctl.
 
 Gate 1 (Ray aarch64) is checked at install; gate 6 (reboot survival) and
 gate 7 (real-workload budgets) are run manually — results for all gates are
 recorded in planning/ACCEPTANCE.md.
 
-Assumes schedulable_mem_gb = 40 (current capacity.toml) and an otherwise
-idle scheduler.
+Assumes an otherwise idle scheduler. Job sizes are derived from the live
+`schedulable_mem_gb` rather than hardcoded, so retuning capacity.toml does not
+silently turn "this job must queue" into "this job fits".
 """
 
 import json
+import re
+import shutil
 import subprocess
 import sys
 import time
@@ -17,10 +20,11 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 SPARKCTL = str(ROOT / ".venv" / "bin" / "sparkctl")
+if not Path(SPARKCTL).exists():
+    SPARKCTL = shutil.which("sparkctl") or SPARKCTL
 HOST = "rwhit"
 RUNS = "/home/rwhit/spark-runs"
 REPO = "/home/rwhit/projection-meshing"
-CAPACITY = 40.0
 
 
 def sh(*args, check=True, timeout=180):
@@ -36,6 +40,19 @@ def sparkctl(*args, **kw):
 
 def ssh(cmd, **kw):
     return sh("ssh", "-4", HOST, cmd, **kw)
+
+
+def capacity() -> float:
+    line = sparkctl("status").splitlines()[0]
+    m = re.search(r"capacity:\s*([\d.]+)/([\d.]+) GB", line)
+    if not m:
+        raise SystemExit(f"cannot parse capacity from: {line}")
+    if float(m.group(1)) != 0:
+        raise SystemExit(f"scheduler is not idle: {line}")
+    return float(m.group(2))
+
+
+CAPACITY = capacity()
 
 
 def submit(name, cmd, mem_gb, *extra):
@@ -65,9 +82,18 @@ def ledger_rows(run_id):
     return [json.loads(line) for line in out.splitlines() if line.strip()]
 
 
+NON_END = {"queued", "started"}
+
+
 def end_row(run_id):
-    rows = [r for r in ledger_rows(run_id) if r["status"] != "started"]
+    rows = [r for r in ledger_rows(run_id) if r["status"] not in NON_END]
     assert len(rows) == 1, f"{run_id}: expected exactly one end row, got {rows}"
+    return rows[0]
+
+
+def queued_row(run_id):
+    rows = [r for r in ledger_rows(run_id) if r["status"] == "queued"]
+    assert len(rows) == 1, f"{run_id}: expected a queued row, got {ledger_rows(run_id)}"
     return rows[0]
 
 
@@ -76,27 +102,34 @@ def start_row(run_id):
 
 
 def gate2():
-    # blocking: two 0.6N jobs -> second queues until first finishes
-    a = submit("gate2-a", "sleep 15", 24)
-    b = submit("gate2-b", "sleep 1", 24)
+    # blocking: two 0.6N jobs -> second waits in the ORCHESTRATOR queue until
+    # the first finishes. It must not be handed to Ray while it cannot run:
+    # queueing inside Ray is what let the 900 s job-supervisor start timeout
+    # kill 78 of 96 shards on 2026-07-25, with no ledger row and no output.
+    big = round(CAPACITY * 0.6)          # two of these cannot co-run
+    a = submit("gate2-a", "sleep 15", big)
+    b = submit("gate2-b", "sleep 1", big)
     wait_status(a, {"RUNNING"})
     time.sleep(2)
     st_b = ray_status(b)
-    assert st_b == "PENDING", f"second 24 GB job should queue, got {st_b}"
+    assert st_b == "QUEUED", f"second {big} GB job should be held by us, got {st_b}"
+    assert queued_row(b), "a queued job must be in the ledger from submit"
     wait_status(a, {"SUCCEEDED"})
     wait_status(b, {"SUCCEEDED"})
     a_end, b_start = end_row(a)["ts"], start_row(b)["ts"]
     assert b_start >= a_end, f"b started {b_start} before a ended {a_end}"
     print(f"gate2 blocking: PASS (b started {b_start} >= a ended {a_end})")
 
-    # zero-sleep race: 10 x 13 GB submitted back-to-back; never > capacity
-    ids = [submit(f"gate2-race-{i}", "sleep 4", 13) for i in range(10)]
+    # zero-sleep race: 10 jobs summing to ~1.25x capacity, submitted
+    # back-to-back with no pacing; reserved memory must never exceed capacity
+    small = max(1, round(CAPACITY / 8))
+    ids = [submit(f"gate2-race-{i}", "sleep 4", small) for i in range(10)]
     for rid in ids:
         wait_status(rid, {"SUCCEEDED"}, timeout=600)
     events = []
     for rid in ids:
-        events.append((start_row(rid)["ts"], 13.0))
-        events.append((end_row(rid)["ts"], -13.0))
+        events.append((start_row(rid)["ts"], float(small)))
+        events.append((end_row(rid)["ts"], -float(small)))
     events.sort(key=lambda e: (e[0], -e[1]))  # pessimistic: starts first on ties
     cur = peak = 0.0
     for _, delta in events:
@@ -144,27 +177,54 @@ def gate4():
 
 
 def gate5():
-    a = submit("gate5-cancel", "sleep 300", 30)
+    half = round(CAPACITY * 0.3)
+    a = submit("gate5-cancel", "sleep 300", half)
     wait_status(a, {"RUNNING"})
     time.sleep(2)
     sparkctl("cancel", a)
     wait_status(a, {"STOPPED"}, timeout=60)
     row = end_row(a)
     assert row["status"] == "cancelled", row
-    b = submit("gate5-free", "true", 30)  # only fits if a's 30 GB was freed
+    b = submit("gate5-free", "true", half)  # only fits if a's memory was freed
     wait_status(b, {"SUCCEEDED"}, timeout=60)
     c = submit("gate5-timeout", "sleep 300", 1, "--timeout-s", "8")
     wait_status(c, {"FAILED"}, timeout=120)
     row = end_row(c)
     assert row["status"] == "timeout", row
     assert 7 <= row["duration_s"] <= 40, row
-    print(f"gate5 cancel+timeout: PASS (cancelled row ok, 30 GB refit ran, "
+    print(f"gate5 cancel+timeout: PASS (cancelled row ok, {half} GB refit ran, "
           f"timeout after {row['duration_s']}s)")
     sparkctl("gc", "--ttl-days", "0", "--force-started")
 
 
+def gate8():
+    """Regression gate for the 2026-07-25 silent-loss incident.
+
+    Oversubscribe the box by 3x in one burst, with no client-side pacing, and
+    require that every single job is accounted for: a `queued` ledger row from
+    submit, then exactly one terminal row, and none of them `lost`. The old
+    behaviour (submitting straight to Ray) lost 78 of 96 here.
+    """
+    n = int(CAPACITY // 4) * 3
+    ids = [submit(f"gate8-{i:03d}", "sleep 5", 4) for i in range(n)]
+
+    seen_queued = 0
+    for rid in ids:                       # every job is visible immediately
+        seen_queued += bool(ledger_rows(rid))
+    assert seen_queued == n, f"only {seen_queued}/{n} jobs are in the ledger"
+
+    for rid in ids:
+        wait_status(rid, {"SUCCEEDED"}, timeout=1800)
+    for rid in ids:
+        row = end_row(rid)
+        assert row["status"] == "succeeded", f"{rid}: {row}"
+        queued_row(rid)
+    print(f"gate8 no-silent-loss: PASS ({n} jobs submitted at once into "
+          f"{CAPACITY:g} GB, {n} succeeded, 0 lost)")
+
+
 if __name__ == "__main__":
-    gates = sys.argv[1:] or ["2", "3", "4", "5"]
+    gates = sys.argv[1:] or ["2", "3", "4", "5", "8"]
     for g in gates:
-        {"2": gate2, "3": gate3, "4": gate4, "5": gate5}[g]()
+        {"2": gate2, "3": gate3, "4": gate4, "5": gate5, "8": gate8}[g]()
     print("all requested gates passed")

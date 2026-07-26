@@ -117,8 +117,39 @@ class Views:
             return None
         return os.path.isdir(f"/proc/{pid}")
 
+    def _queued_row(self, rid: str, entry: dict, detail: bool) -> dict:
+        """A job the orchestrator is holding: it has no Ray state, no sidecar,
+        no worktree and no log yet — only what the client declared. Rendered
+        as its own QUEUED status so a waiting fleet is visible rather than
+        merely absent."""
+        md = entry.get("metadata") or {}
+        row = {
+            "run_id": rid, "registered": False,
+            "status": "QUEUED", "effective_status": "QUEUED", "badges": [],
+            "name": entry.get("name"), "desc": md.get("desc"),
+            "sha": entry.get("sha"), "branch": md.get("branch"),
+            "dirty": md.get("dirty") == "1", "variant": md.get("variant"),
+            "seeds": None, "mem_gb": entry.get("mem_gb"),
+            "progress": {"step": None, "total": None,
+                         "steps_per_s": None, "eta_s": None},
+            "last_loss": None, "resources": {}, "elapsed_s": None,
+            "gpu_hours": self._gpu_hours(rid),
+            "reads": {"declared": [], "observed": [], "contaminated": False},
+            "started_ts": None, "ended_ts": None,
+            "queued_ts": entry.get("queued_ts"),
+        }
+        if detail:
+            row.update(sidecar={}, cmd=entry.get("cmd"), log_path=None,
+                       artifacts_dir=None, run_dir=None,
+                       ray_message="waiting for capacity; not yet submitted to Ray",
+                       checkpoint=None, config=None, metrics_path=None)
+        return row
+
     def job_row(self, rid: str, detail: bool = False) -> dict:
         with self.c._lock:
+            queued = self.c.queued.get(rid)
+            if queued is not None and rid not in self.c.ray_jobs:
+                return self._queued_row(rid, dict(queued), detail)
             ray = dict(self.c.ray_jobs.get(rid, {}))
             sidecar = dict(self.c.sidecars.get(rid, {}))
             metrics = self.c.metrics.get(rid, {})
@@ -251,7 +282,7 @@ class Views:
     # ------------------------------------------------------------------ lists
     def _all_run_ids(self) -> set[str]:
         with self.c._lock:
-            return set(self.c.ray_jobs) | set(self.c.sidecars)
+            return set(self.c.ray_jobs) | set(self.c.sidecars) | set(self.c.queued)
 
     def jobs(self) -> dict:
         """Active + recently-terminal jobs (the main table)."""
@@ -260,12 +291,18 @@ class Views:
             self._maybe_freeze(rid)
             row = self.job_row(rid)
             rows.append(row)
-        active = [r for r in rows if r["status"] in ("RUNNING", "PENDING", "UNKNOWN")]
-        terminal = [r for r in rows if r["status"] not in
-                    ("RUNNING", "PENDING", "UNKNOWN")]
+        live = ("RUNNING", "PENDING", "UNKNOWN")
+        active = [r for r in rows if r["status"] in live]
+        # Queued jobs are listed in admission order (oldest first — the next
+        # one to run is at the top) below the jobs actually on the box, and
+        # are never truncated: the whole point is that a waiting fleet stays
+        # visible.
+        waiting = [r for r in rows if r["status"] == "QUEUED"]
+        terminal = [r for r in rows if r["status"] not in live + ("QUEUED",)]
         terminal.sort(key=lambda r: r.get("ended_ts") or "", reverse=True)
         active.sort(key=lambda r: r.get("started_ts") or "", reverse=True)
-        return {"jobs": active + terminal[:10],
+        waiting.sort(key=lambda r: r.get("queued_ts") or "")
+        return {"jobs": active + waiting + terminal[:10],
                 "generated_ts": time.time()}
 
     def history(self) -> dict:

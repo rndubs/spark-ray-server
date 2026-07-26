@@ -10,6 +10,7 @@ dependencies = []
 [project.scripts]
 sparkctl = "spark_orchestrator.cli:main"
 spark-ray-head = "spark_orchestrator.head:main"
+spark-admit = "spark_orchestrator.admit:main"
 spark-dashboard = "spark_orchestrator.dashboard.app:main"
 
 [project.optional-dependencies]
