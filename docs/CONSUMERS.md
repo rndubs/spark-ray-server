@@ -64,6 +64,15 @@ Then submit with `--class my-train` (uses the budget) or `--mem-gb N` (ad-hoc).
 A job whose `mem_gb` exceeds `schedulable_mem_gb` is rejected at submit — it
 could never run.
 
+**What you declare is what you get.** Since 2026-07-26 the number is enforced:
+your command runs inside its own cgroup with `MemoryMax` set to it and swap
+capped at zero, so going over kills *your* job — terminal ledger status
+`oom_killed`, with `mem_limit_gb` and a sampled `mem_peak_gb` on the row —
+rather than the box. Under-declare and you get a clear one-line failure and a
+number to change; you no longer take everyone else's jobs down with you.
+(Page cache is reclaimed before the cap bites, so heavy file I/O is fine; it
+is resident memory that has to fit.)
+
 ## 3. Submit from the Mac
 
 `sparkctl` is repo-agnostic; point `--repo` at your project (or set
@@ -99,8 +108,11 @@ The guarantee that makes that safe: **a job that cannot start yet never
 disappears.** `submit` writes a `queued` ledger row before it returns, so the
 run is visible to `sparkctl list` / `status` (with queue position) from that
 moment, and every run reaches a terminal status — `succeeded`, `failed`,
-`cancelled`, `timeout`, or `lost`. `lost` means something killed the run
-without it writing its own row; the row carries the reason. Silence is not a
+`cancelled`, `timeout`, `oom_killed`, or `lost`. `oom_killed` means the job
+went past its declared `mem_gb` and was killed at that limit — note it is
+kept distinct from `timeout` even though both arrive as SIGKILL, and from
+`lost`, which means something killed the run without it writing its own row.
+Every one of those rows carries a `reason`. Silence is not a
 possible outcome.
 
 (Before 2026-07-26 this was not true: `submit` POSTed straight to Ray, and Ray
@@ -160,10 +172,11 @@ copyable LEDGER line. All localhost-only behind the SSH tunnel.
 
 ## Limits worth knowing
 
-- **Memory budgets are accounting, not enforcement** (no MIG/cgroups in v1):
-  a job that lies about `mem_gb` can still OOM the box. Measure and declare
-  honestly. Capacity = `total − os_reserve − vllm_reserve`; the vLLM reserve
-  is whatever the always-on operator server holds (0 when it's down).
+- **CPU/unified memory is enforced per job; GPU memory is not.** `mem_gb`
+  is a real cgroup cap (above); there is no MIG partitioning, so two jobs can
+  still fight over VRAM. Capacity = `total − os_reserve − vllm_reserve`; the
+  vLLM reserve is whatever the always-on operator server holds (0 when it's
+  down).
 - **The `[dashboard]` metrics adapter is currently global** — one
   `metrics_filename`/`loss_keys` for the whole box. Two consumers with
   *different* metrics schemas running at once would need per-repo adapter

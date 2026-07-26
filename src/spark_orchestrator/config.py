@@ -46,6 +46,13 @@ def load_capacity(text: str | None = None) -> dict:
         cfg["total_mem_gb"] - cfg["os_reserve_gb"] - cfg["vllm_reserve_gb"]
     )
     cfg.setdefault("budgets", {}).setdefault("default", 8)
+    # Memory enforcement is ON unless a deployment explicitly turns it off: a
+    # declared budget that nothing checks is what let one job take the whole
+    # host down five times on 2026-07-26. See memguard.py.
+    enf = cfg.setdefault("enforcement", {})
+    enf.setdefault("mem_enforce", True)
+    enf.setdefault("mem_limit_factor", 1.0)
+    enf.setdefault("mem_limit_min_gb", 1.0)
     cfg.setdefault("paths", {}).setdefault("runs_root", "~/spark-runs")
     cfg.setdefault("gc", {}).setdefault("failed_tree_ttl_days", 7)
     return cfg

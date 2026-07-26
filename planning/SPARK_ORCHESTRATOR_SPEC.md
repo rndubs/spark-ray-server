@@ -83,6 +83,22 @@ sparkctl submit/status/logs/cancel ──► Ray Jobs API (127.0.0.1:8265, via S
   `.venv-train`, `.venv-serve`, `data/brepgraph`'s gitignored emits,
   `data/hexagent_traces`, `target/release`); worktree removed on success,
   kept on failure with a TTL sweep (`sparkctl gc`, default 7 days).
+- **Memory enforcement** (added 2026-07-26, after the second incident
+  below): the job command runs inside a transient per-job systemd scope with
+  `MemoryMax = mem_gb x mem_limit_factor` (factor 1.0) and `MemorySwapMax=0`,
+  so a job that exceeds its declaration is killed by the kernel *inside its
+  own cgroup*. Before this, `mem_gb` was admission bookkeeping only
+  (`MemoryMax=infinity` on the head); on 2026-07-26 one 8 GB-declared job
+  allocated ~119 GB of 121 GB, the host OOM killer chose the Ray head, and
+  five separate host-wide outages took down every concurrently running job.
+  The driver stays outside the scope so it survives and writes the terminal
+  row. A cgroup kill is SIGKILL, indistinguishable by exit code from the
+  timeout kill, so the status is decided by the cgroup's `memory.events`
+  `oom_kill` counter and systemd's `Result=oom-kill` on the scope — never by
+  the exit code — and gets its own terminal status `oom_killed`.
+  Config: `[enforcement]` in capacity.toml; `SPARK_MEM_ENFORCE=0` opts a
+  single driver out. If scopes are unavailable the job runs uncapped, loudly,
+  with `mem_enforced: false` on its row.
 - **Admission queue** (added 2026-07-26, after the incident below):
   submissions land in `~/spark-runs/queue/pending` and the `spark-admit`
   user unit hands them to Ray strictly FIFO, only once the declared `mem_gb`
@@ -98,8 +114,9 @@ sparkctl submit/status/logs/cancel ──► Ray Jobs API (127.0.0.1:8265, via S
 - **Ledger**: append-only JSONL (one fixed path, e.g.
   `~/spark-runs/ledger.jsonl`). Three rows per job (queued, start, end):
   `{ts, run_id, name, sha, cmd, mem_gb, status: queued|started|succeeded|
-  failed|cancelled|timeout|lost, exit_code, duration_s, reason,
-  artifacts_dir, log_path}`. A `queued` row is written by `submit` itself, so
+  failed|cancelled|timeout|lost|oom_killed, exit_code, duration_s, reason,
+  artifacts_dir, log_path}`. End rows also carry `mem_enforced`,
+  `mem_limit_gb`, `mem_peak_gb`, `oom_kill_count`. A `queued` row is written by `submit` itself, so
   a run is visible from the moment the client's command returns.
   Never rewritten, never sorted, no other process writes it.
 - **Logs**: per-job file `~/spark-runs/<run_id>/job.log` (stdout+stderr

@@ -3,8 +3,10 @@
 # /etc/spark-orchestrator/capacity.toml.
 #
 # schedulable_mem_gb is DERIVED: total - os_reserve - vllm_reserve.
-# These are declared budgets (bookkeeping, not enforcement) — measure, don't
-# guess. Restart spark-ray.service after changing reserves.
+# These budgets are both what the scheduler admits against AND — since
+# 2026-07-26 — the hard cap each job actually runs under (see [enforcement]),
+# so measure them, don't guess. Restart spark-ray.service after changing
+# reserves.
 
 # measured_on = 2026-07-18
 total_mem_gb = 121        # `free -g` total on the GB10
@@ -23,6 +25,22 @@ vllm_reserve_gb = 72      # operator vLLM at --gpu-memory-utilization 0.60
 default = 8
 hexgen-train-27m = 10
 hexgen-eval = 6
+
+# Per-job memory enforcement. Each job command runs inside its own transient
+# systemd scope with MemoryMax = mem_gb * mem_limit_factor and swap capped at
+# zero, so a job that blows past its declaration is killed on its own instead
+# of the kernel picking the biggest process on the box (which on 2026-07-26
+# was the Ray head — five host-wide outages in a day, ~30 shards lost).
+#
+# mem_limit_factor is 1.0 on purpose: any headroom means the sum of what jobs
+# MAY use exceeds what the scheduler admitted, which leaves the host-OOM path
+# open. A job that needs more declares more. Raise it only as a temporary
+# migration aid, and never above what (factor x schedulable) can survive.
+# Per-driver escape hatch for debugging: SPARK_MEM_ENFORCE=0.
+[enforcement]
+mem_enforce = true
+mem_limit_factor = 1.0
+mem_limit_min_gb = 1.0
 
 [paths]
 runs_root = "/home/rwhit/spark-runs"

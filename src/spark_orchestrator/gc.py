@@ -2,7 +2,8 @@
 
 Sweeps trees under <runs_root>/trees:
 - runs whose latest ledger row is terminal
-  (succeeded/failed/cancelled/timeout/lost) and whose tree is older than the
+  (succeeded/failed/cancelled/timeout/lost/oom_killed) and whose tree is older
+  than the
   TTL -> removed;
 - orphan trees with no ledger row at all, older than the TTL -> removed;
 - runs still marked `started` are left alone (they may be live; a dead
@@ -20,7 +21,8 @@ from pathlib import Path
 
 from . import config, ledger, worktree
 
-TERMINAL = {"succeeded", "failed", "cancelled", "timeout", "lost"}
+TERMINAL = {"succeeded", "failed", "cancelled", "timeout", "lost",
+            "oom_killed"}
 
 
 def sweep(cfg: dict, ttl_days: float, dry_run: bool, force_started: bool) -> dict:

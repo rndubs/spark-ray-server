@@ -4,7 +4,7 @@ All gates run against the real GB10 (`spark-3b57`, aarch64, 121 GB unified),
 Ray 2.56.1, schedulable_mem_gb = 40 (total 121 − os 9 − vllm 72; operator
 vLLM up at `--gpu-memory-utilization 0.60` throughout).
 
-Gates 2–5 are scripted: `tools/acceptance.py [2 3 4 5]`.
+Gates 2–5, 8 and 9 are scripted: `tools/acceptance.py [2 3 4 5 8 9]`.
 
 | # | Gate | Result |
 |---|------|--------|
@@ -15,6 +15,8 @@ Gates 2–5 are scripted: `tools/acceptance.py [2 3 4 5]`.
 | 5 | Cancel + timeout ledger rows, capacity freed | PASS — cancel: ledger `cancelled` row via SIGTERM handler, a 30 GB job fit immediately after (capacity freed); `--timeout-s 8` on `sleep 300`: ledger `timeout` row at 8.7 s. |
 | 6 | Reboot survival, doctor passes from Mac | READY, awaiting reboot — unit enabled, `Linger=yes`; reboot needs interactive auth (polkit `CanReboot=challenge`, sudo needs a password), which a non-interactive agent cannot supply. Run `ssh -4 -t rwhit "sudo reboot"`, wait ~2 min, then `sparkctl doctor` must pass with no manual steps. |
 | 7 | Real-workload budgets measured into capacity.toml | PASS — real 27M baseline train (500 steps, 111 s, CUDA) via sparkctl: peak RSS 2.9 GB, system MemAvailable dip 7.1 GB → budget 10. Real eval (`sample_eval.py --n 32`, 20-graph cap, 35 s): RSS 1.6 GB, dip 3.1 GB → budget 6. Written to capacity.toml (live + example) with measured_on 2026-07-18. Note: eval reported `n_verify_crash: 20/20` — a consumer-repo issue at SHA `67063374`, outside the orchestrator contract (job exited 0). |
+
+| 9 | Declared `mem_gb` is enforced, not just accounted | PENDING the deploy window (the code is on `claude/m4-enforce-mem-gb`; activating it needs the orchestrator reinstalled on the Spark, which the user schedules). Verified 2026-07-26 end-to-end against the REAL driver in an isolated harness (throwaway runs_root/repo/capacity.toml, no live service touched, every case bounded at 1 GB): a job declaring 1 GB that allocated 512 MB at a time died at 0.8 GB sampled peak with ledger `oom_killed`, `exit_code=-9`, `mem_enforced=true`, `mem_limit_gb=1.0` and a reason naming `--mem-gb`; a 256 MB job under the same cap succeeded; a `sleep 300` with `--timeout-s 6` still reported `timeout` (NOT `oom_killed`) though both are SIGKILL; `SPARK_MEM_ENFORCE=0` ran the same 4 GB hog to completion with `mem_enforced=false`. Host `free -g` unchanged throughout; no service restarted. Note: the OOM verdict came from systemd's `Result=oom-kill` — the cgroup `oom_kill` counter read 0 because the job died inside one poll interval, which is exactly why there are two signals. |
 
 Gate 7 runs: `hexgen-train-27m-20260719-025615-9154`, `hexgen-eval-20260719-025842-3a88`
 (artifacts under `~/spark-runs/<run_id>/artifacts`, incl. checkpoint + eval summary).
