@@ -81,6 +81,17 @@ class Collector:
         self.fd_reads: dict[str, dict] = {}       # run_id -> {observed:[{path,tier}], ts}
         self.gpu_hours: dict[str, dict] = {}      # run_id -> {seconds, util_sum, util_n, frozen}
         self.proc: dict[str, dict] = {}           # run_id -> {rss_mb, gpu_mem_mb}
+        # Runs whose metrics were searched for and read while NOT active. A
+        # finished run's metrics file does not grow, so it is never searched
+        # again. Before this set existed the 5 s metrics poll rglob'd the
+        # artifacts tree of every one of ~4,800 run dirs (some with thousands
+        # of files), holding ~0.8 of a core around the clock. A run that
+        # becomes active again is dropped from the set.
+        self.metrics_settled: set[str] = set()
+        # run_id -> planned step count (config.json), cached for runs that are
+        # not active; same reasoning, but for the per-request /api/jobs join.
+        self.total_steps_settled: dict[str, int | None] = {}
+        self.artifact_searches = 0   # rglob calls; observability + tests
 
     # ---------------------------------------------------------------- lifecycle
     def start(self) -> None:
@@ -347,15 +358,40 @@ class Collector:
         art = sidecar.get("artifacts_dir")
         if not art or not os.path.isdir(art):
             return None
-        cands = list(Path(art).rglob(self.metrics_name))
+        cands = self.search_artifacts(art, self.metrics_name)
         if not cands:
             return None
         return str(max(cands, key=lambda p: p.stat().st_mtime))
 
+    def search_artifacts(self, root: str, pattern: str) -> list[Path]:
+        """The one place the dashboard walks an artifacts tree. Counted, so a
+        regression back to walking every run every poll shows in tests."""
+        self.artifact_searches += 1
+        return list(Path(root).rglob(pattern))
+
+    def active_ids(self) -> set[str]:
+        """Runs Ray reports RUNNING or PENDING: the only ones whose files can
+        still change."""
+        with self._lock:
+            return {rid for rid, j in self.ray_jobs.items()
+                    if STATUS_MAP.get(j.get("status")) in ("RUNNING", "PENDING")}
+
     def _poll_metrics(self) -> None:
+        active = self.active_ids()
         with self._lock:
             sidecars = dict(self.sidecars)
+            # A run that is active again (re-submitted id, Ray resumed) must
+            # be followed again.
+            self.metrics_settled -= active
+            settled = set(self.metrics_settled)
         for rid, sc in sidecars.items():
+            if rid in settled:
+                continue
+            if rid not in active:
+                # Search and read it once (picking up anything written after
+                # the last active poll), then never again.
+                with self._lock:
+                    self.metrics_settled.add(rid)
             path = self._metrics_path_for(rid, sc)
             if not path:
                 continue
