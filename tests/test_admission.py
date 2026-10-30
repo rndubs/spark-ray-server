@@ -713,6 +713,88 @@ class TestDashboard(Base):
         self.assertTrue(c2.host["admit"]["up"])
 
 
+class TestDashboardSettledSearch(Base):
+    """The 5 s metrics poll used to rglob every run's artifacts tree (~4,800
+    runs on the Spark), holding ~0.8 of a core forever, and /api/jobs rglob'd
+    config.json for every run per request (>100 s). Finished runs are now
+    searched once; active runs every poll."""
+
+    def setUp(self):
+        super().setUp()
+        import json as _json
+        from spark_orchestrator.dashboard.collect import Collector
+        from spark_orchestrator.dashboard.views import Views
+        cfg = dict(self.cfg)
+        cfg["dashboard"] = {"data_root": self.tmp.name}
+        self.c = Collector(cfg)
+        self.v = Views(self.c)
+        self.runs = {"done-1": "SUCCEEDED", "done-2": "FAILED",
+                     "live-1": "RUNNING", "wait-1": "PENDING"}
+        for rid in list(self.runs) + ["old-sidecar-only"]:
+            run_dir = Path(self.tmp.name) / rid
+            art = run_dir / "artifacts" / "deep"
+            art.mkdir(parents=True)
+            (art / "metrics.jsonl").write_text('{"step": 1}\n')
+            (art / "config.json").write_text(_json.dumps({"steps": 10}))
+            (run_dir / "dashboard.json").write_text(_json.dumps({
+                "run_id": rid, "artifacts_dir": str(run_dir / "artifacts"),
+                "started_ts": "T"}))
+        self.c._poll_sidecars()
+        self.c.ray_jobs = {rid: {"submission_id": rid, "status": st,
+                                 "metadata": {}}
+                           for rid, st in self.runs.items()}
+        self.searched = []
+        orig = self.c.search_artifacts
+
+        def counting(root, pattern):
+            self.searched.append((Path(root).parent.name
+                                  if Path(root).name == "artifacts"
+                                  else Path(root).name, pattern))
+            return orig(root, pattern)
+        self.c.search_artifacts = counting
+
+    def metric_searches(self):
+        return sorted(r for r, p in self.searched if p == "metrics.jsonl")
+
+    def test_finished_runs_searched_once_active_every_poll(self):
+        self.c._poll_metrics()
+        self.assertEqual(self.metric_searches(),
+                         ["done-1", "done-2", "live-1", "old-sidecar-only", "wait-1"])
+        self.searched.clear()
+        self.c._poll_metrics()
+        self.assertEqual(self.metric_searches(), ["live-1", "wait-1"])
+        # finished runs' rows were still read on their one pass
+        self.assertEqual(self.c.metrics["done-1"]["rows"], [{"step": 1}])
+
+    def test_a_run_that_becomes_active_again_is_followed_again(self):
+        self.c._poll_metrics()
+        self.c.ray_jobs["done-1"]["status"] = "RUNNING"
+        self.searched.clear()
+        self.c._poll_metrics()
+        self.assertIn("done-1", self.metric_searches())
+        self.assertNotIn("done-1", self.c.metrics_settled)
+
+    def test_a_run_finishing_gets_one_final_read_then_settles(self):
+        self.c._poll_metrics()
+        self.c.ray_jobs["live-1"]["status"] = "SUCCEEDED"
+        self.searched.clear()
+        self.c._poll_metrics()
+        self.assertEqual(self.metric_searches(), ["live-1", "wait-1"])
+        self.searched.clear()
+        self.c._poll_metrics()
+        self.assertEqual(self.metric_searches(), ["wait-1"])
+
+    def test_api_jobs_searches_config_only_for_active_runs_after_first_call(self):
+        self.v.jobs()
+        first = sorted({r for r, p in self.searched if p == "config.json"})
+        self.assertIn("done-1", first)
+        self.searched.clear()
+        rows = {r["run_id"]: r for r in self.v.jobs()["jobs"]}
+        again = sorted({r for r, p in self.searched if p == "config.json"})
+        self.assertEqual(again, ["live-1", "wait-1"])
+        self.assertEqual(rows["done-1"]["progress"]["total"], 10)  # from cache
+
+
 class TestState(Base):
     def test_state_reports_the_queue_and_a_dead_admitter(self):
         self.enqueue("job-1", 8.0)

@@ -36,12 +36,14 @@ def _last_loss(rows: list[dict], keys: list[str]) -> tuple[float | None, bool]:
     return None, False
 
 
-def _total_steps(run_dir: str | None, artifacts_dir: str | None) -> int | None:
+def _total_steps(run_dir: str | None, artifacts_dir: str | None,
+                 search=None) -> int | None:
     """hexgen writes config.json with the planned step count; best-effort."""
+    search = search or (lambda root, pat: list(Path(root).rglob(pat)))
     for base in (artifacts_dir, run_dir):
         if not base or not os.path.isdir(base):
             continue
-        for cfg in Path(base).rglob("config.json"):
+        for cfg in search(base, "config.json"):
             try:
                 doc = json.loads(cfg.read_text())
                 if _num(doc.get("steps")):
@@ -177,7 +179,20 @@ class Views:
         health = self._health(status, sidecar, metrics, nan, pid_alive)
 
         run_dir = sidecar.get("_run_dir")
-        total = _total_steps(run_dir, sidecar.get("artifacts_dir"))
+        # /api/jobs and /api/history build a row for EVERY known run (~4,800)
+        # per request, so an uncached config.json rglob here made /api/jobs
+        # take >100 s. Active runs are re-read (config can appear late);
+        # everything else is read once and remembered.
+        settled = self.c.total_steps_settled
+        if not running and rid in settled:
+            total = settled[rid]
+        else:
+            total = _total_steps(run_dir, sidecar.get("artifacts_dir"),
+                                 search=self.c.search_artifacts)
+            if running:
+                settled.pop(rid, None)
+            else:
+                settled[rid] = total
         cur_step = None
         for row in reversed(rows):
             if _num(row.get("step")):
