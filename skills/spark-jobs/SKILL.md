@@ -39,12 +39,22 @@ memory budget and a pinned worktree.
    measured peak on the row) instead of the kernel killing the biggest
    process on the box. Measure, then declare — under-declaring now kills
    your job, not the host. GPU memory is still unenforced (no MIG).
+5. **Declare `--cpus N` (since 2026-10-30).** Admission also counts CPU
+   slots: the queue head waits until both its `mem_gb` and its `cpus` fit
+   (`schedulable_cpus` = 20 on the Spark; undeclared = `default_cpus`, 6).
+   Memory-only admission once ran the 20-core box at load ~52 with 12 GB in
+   use — every job ~2× slower. Declare what the job really runs in parallel
+   (workers + a compiler's `-j`). The job sees `SPARK_CPUS=<cpus>`, and
+   `WORKERS=<cpus>` unless your `--env WORKERS=…` sets it, so a script
+   reading `${WORKERS:-8}` matches the reservation; size `-j`/thread pools
+   from `$SPARK_CPUS`. Never inflate `mem_gb` to throttle CPU work.
 
 ## The job contract
 
 Your `--cmd` runs with `cwd` = a git worktree of your repo pinned at the
 submission SHA (a later push never disturbs a running job). Injected env:
-`SPARK_RUN_ID`, `SPARK_SHA`, `SPARK_ARTIFACTS_DIR`. **Exit 0 = success**; the
+`SPARK_RUN_ID`, `SPARK_SHA`, `SPARK_ARTIFACTS_DIR`, `SPARK_CPUS` (plus
+`WORKERS` = the declared cpus unless you set it). **Exit 0 = success**; the
 orchestrator never parses output. **Write durable outputs to
 `$SPARK_ARTIFACTS_DIR`** (`~/spark-runs/<run_id>/artifacts`) — the worktree is
 disposable. Gitignored deps (venvs, data, binaries) are symlinked in per the
@@ -56,6 +66,7 @@ repo's `[[repos]].symlink_assets` in `capacity.toml`.
 sparkctl doctor                 # ALWAYS the first triage step
 sparkctl submit --name <n> --repo /home/rwhit/<proj> \
     --class <budget-class> | --mem-gb <N> \
+    --cpus <N> \
     --desc "one line (REQUIRED — dashboard + LEDGER)" \
     [--variant V --seed S --input <declared-read-dir>] \
     [--metrics <path>] [--env K=V] [--ref <git-ref>] [--timeout-s N] [--wait] \
@@ -70,7 +81,7 @@ sparkctl dashboard [--open]     # tunnel to the training dashboard, print URL
 
 `--desc` is required. `--class` pulls a measured budget from `capacity.toml`;
 `--mem-gb` is ad-hoc. A `mem_gb` over `schedulable_mem_gb` is rejected at
-submit (it could never run). Capacity = `total − os_reserve − vllm_reserve`
+submit (it could never run), as is a `cpus` over `schedulable_cpus`. Capacity = `total − os_reserve − vllm_reserve`
 (the vLLM reserve is the always-on operator server; 0 when down).
 
 ## Submitting a fleet: do not pace it yourself

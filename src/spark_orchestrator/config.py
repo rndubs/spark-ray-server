@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import tomllib
 from pathlib import Path
 
@@ -9,6 +10,10 @@ CAPACITY_PATHS = [
     Path("~/.config/spark-orchestrator/capacity.toml").expanduser(),
     Path("/etc/spark-orchestrator/capacity.toml"),
 ]
+# CPU slots a job reserves when it declares none (capacity.toml `default_cpus`
+# overrides). 6 = a typical harness's workers plus its driver and compiler.
+DEFAULT_CPUS = 6
+
 CLIENT_PATH = Path("~/.config/spark-orchestrator/client.toml").expanduser()
 
 CLIENT_DEFAULTS = {
@@ -46,6 +51,21 @@ def load_capacity(text: str | None = None) -> dict:
         cfg["total_mem_gb"] - cfg["os_reserve_gb"] - cfg["vllm_reserve_gb"]
     )
     cfg.setdefault("budgets", {}).setdefault("default", 8)
+    # CPU slots (2026-10-30). Admission was on memory alone, so CPU-bound
+    # jobs (8-worker harnesses plus `cargo -j 8`) were co-admitted until the
+    # 20-core GB10 ran at load ~52 with 12 of 121 GB in use: every job ran ~2x
+    # slower and load-induced timeouts appeared. Each job now also declares
+    # `cpus`, and the head of the queue is admitted only if both fit.
+    #
+    # schedulable_cpus defaults to the host's core count — but only when this
+    # process IS the host. A client parsing the server's config fetched over
+    # ssh (`text` given) must not substitute the Mac's core count, so it gets
+    # None and leaves the check to the server.
+    if "schedulable_cpus" not in cfg:
+        cfg["schedulable_cpus"] = None if text is not None else (os.cpu_count() or 1)
+    if cfg["schedulable_cpus"] is not None:
+        cfg["schedulable_cpus"] = int(cfg["schedulable_cpus"])
+    cfg["default_cpus"] = int(cfg.get("default_cpus", DEFAULT_CPUS))
     # Memory enforcement is ON unless a deployment explicitly turns it off: a
     # declared budget that nothing checks is what let one job take the whole
     # host down five times on 2026-07-26. See memguard.py.
@@ -68,6 +88,15 @@ def trees_root(cfg: dict) -> Path:
 
 def ledger_path(cfg: dict) -> Path:
     return runs_root(cfg) / "ledger.jsonl"
+
+
+def cpus_of(cfg: dict, declared) -> int:
+    """A job's CPU reservation: what it declared, else the config default.
+    Jobs submitted before CPU slots existed carry no `cpus` anywhere and are
+    counted at the default, so a deploy mid-campaign cannot over-commit."""
+    if declared in (None, ""):
+        return int(cfg.get("default_cpus", DEFAULT_CPUS))
+    return int(float(declared))
 
 
 def budget_for(cfg: dict, job_class: str | None) -> float:

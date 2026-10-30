@@ -23,6 +23,13 @@ would fit right now. That trades a little utilisation for a guarantee that a
 large job cannot be starved indefinitely by a stream of small ones, and it
 makes queue position mean what a client expects it to mean.
 
+Admission is on two resources: declared memory (`mem_gb`) and CPU slots
+(`cpus`, since 2026-10-30). The head of line is admitted only if BOTH fit.
+Memory alone let CPU-bound jobs pile onto the 20-core GB10 until it ran at
+load ~52 with 12 of 121 GB in use, every job ~2x slower. A job whose metadata
+carries no `cpus` (anything submitted before CPU slots existed) is counted at
+`default_cpus`.
+
 The reservation we schedule against is read back from Ray each loop rather
 than tracked in memory, so jobs submitted by anything other than this daemon
 (including everything submitted before this daemon existed) are still counted
@@ -71,6 +78,22 @@ def reserved_gb(jobs: list[dict]) -> float:
     return total
 
 
+def reserved_cpus(jobs: list[dict], default_cpus: int) -> int:
+    """CPU slots held by PENDING/RUNNING jobs, read from Ray job metadata the
+    same way as reserved_gb. A job with no `cpus` in its metadata predates CPU
+    slots and is counted at default_cpus, so deploying this mid-campaign
+    neither ignores the jobs already running nor over-commits the cores."""
+    total = 0
+    for j in jobs:
+        if j.get("status") in RAY_ACTIVE:
+            raw = (j.get("metadata") or {}).get("cpus")
+            try:
+                total += int(float(raw)) if raw not in (None, "") else default_cpus
+            except (TypeError, ValueError):
+                total += default_cpus
+    return total
+
+
 class Admitter:
     def __init__(self, cfg: dict, jobs: RayJobs):
         self.cfg = cfg
@@ -87,10 +110,17 @@ class Admitter:
         cfg = self.cfg
         sched = cfg["schedulable_mem_gb"]
         free = sched - reserved_gb(ray_jobs)
+        default_cpus = int(cfg.get("default_cpus", config.DEFAULT_CPUS))
+        # None only for a config parsed client-side; the daemon always has a
+        # number (config.load_capacity defaults it to the host's core count).
+        sched_cpus = cfg.get("schedulable_cpus")
+        free_cpus = (None if sched_cpus is None
+                     else sched_cpus - reserved_cpus(ray_jobs, default_cpus))
         admitted = []
 
         for path, entry in queue.pending(cfg):
             mem = float(entry["mem_gb"])
+            cpus = config.cpus_of(cfg, entry.get("cpus"))
 
             if mem > sched:
                 # Capacity shrank under a job that was accepted at submit
@@ -103,12 +133,22 @@ class Admitter:
                 )
                 continue
 
-            if mem > free:
+            if sched_cpus is not None and cpus > sched_cpus:
+                self._fail_pending(
+                    path, entry,
+                    f"declares cpus={cpus} but schedulable_cpus is "
+                    f"{sched_cpus} — this job can never run",
+                )
+                continue
+
+            if mem > free or (free_cpus is not None and cpus > free_cpus):
                 break  # strict FIFO: do not skip ahead of the head of line
 
             if self._submit_to_ray(path, entry):
                 admitted.append(entry["run_id"])
                 free -= mem
+                if free_cpus is not None:
+                    free_cpus -= cpus
 
         return admitted
 
@@ -121,12 +161,17 @@ class Admitter:
         lose a job on the same crash.
         """
         run_id = entry["run_id"]
+        # The reservation is read back from Ray metadata each loop, so the
+        # metadata must carry the cpus we admitted against — including for an
+        # entry from an older client that never declared any.
+        metadata = dict(entry.get("metadata") or {})
+        metadata.setdefault("cpus", str(config.cpus_of(self.cfg, entry.get("cpus"))))
         try:
             self.jobs.submit(
                 entrypoint=entry["entrypoint"],
                 submission_id=run_id,
                 entrypoint_resources={"mem_gb": float(entry["mem_gb"])},
-                metadata=entry["metadata"],
+                metadata=metadata,
             )
         except Exception as e:
             if _is_duplicate(e):
@@ -139,7 +184,8 @@ class Admitter:
         except OSError:
             queue.admitted_dir(self.cfg).mkdir(parents=True, exist_ok=True)
             path.rename(queue.admitted_dir(self.cfg) / path.name)
-        print(f"[admit] {run_id} mem_gb={entry['mem_gb']:g}", flush=True)
+        print(f"[admit] {run_id} mem_gb={entry['mem_gb']:g} "
+              f"cpus={metadata['cpus']}", flush=True)
         return True
 
     def _fail_pending(self, path, entry, reason: str) -> None:
@@ -214,7 +260,9 @@ class Admitter:
         lost = self.reconcile(ray_jobs)
         queue.touch_heartbeat(self.cfg)
         return {"admitted": admitted, "lost": lost,
-                "reserved_gb": reserved_gb(ray_jobs)}
+                "reserved_gb": reserved_gb(ray_jobs),
+                "reserved_cpus": reserved_cpus(
+                    ray_jobs, int(self.cfg.get("default_cpus", config.DEFAULT_CPUS)))}
 
 
 def _is_duplicate(exc: Exception) -> bool:
@@ -234,6 +282,8 @@ def main() -> None:
     queue.admitted_dir(cfg).mkdir(parents=True, exist_ok=True)
     adm = Admitter(cfg, RayJobs(args.ray_port))
     print(f"[admit] schedulable_mem_gb={cfg['schedulable_mem_gb']:g} "
+          f"schedulable_cpus={cfg['schedulable_cpus']} "
+          f"default_cpus={cfg['default_cpus']} "
           f"({cfg['_path']}), ray port {args.ray_port}", flush=True)
 
     while True:

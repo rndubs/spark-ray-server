@@ -63,6 +63,7 @@ def cmd_submit(args, ccfg) -> int:
     if args.ref: spec["ref"] = args.ref
     if args.cmd: spec["cmd"] = args.cmd
     if args.mem_gb is not None: spec["mem_gb"] = args.mem_gb
+    if args.cpus is not None: spec["cpus"] = args.cpus
     if args.job_class: spec["job_class"] = args.job_class
     if args.artifacts_dir: spec["artifacts_dir"] = args.artifacts_dir
     if args.timeout_s is not None: spec["timeout_s"] = args.timeout_s
@@ -97,6 +98,16 @@ def cmd_submit(args, ccfg) -> int:
             f"mem_gb={spec['mem_gb']} exceeds schedulable capacity "
             f"{cap['schedulable_mem_gb']} GB — this job can never run"
         )
+    # CPU slots: admission also waits for this many cores to be free, and the
+    # driver exports it as SPARK_CPUS (and WORKERS, unless --env sets WORKERS).
+    spec["cpus"] = config.cpus_of(cap, spec.get("cpus"))
+    if spec["cpus"] < 1:
+        sys.exit(f"cpus={spec['cpus']} — a job needs at least 1 CPU slot")
+    if cap.get("schedulable_cpus") is not None and spec["cpus"] > cap["schedulable_cpus"]:
+        sys.exit(
+            f"cpus={spec['cpus']} exceeds schedulable_cpus "
+            f"{cap['schedulable_cpus']} — this job can never run"
+        )
 
     # ref -> SHA at submission; the SHA is what gets pinned (spec §2)
     res = tunnel.ssh_run(
@@ -127,7 +138,7 @@ def cmd_submit(args, ccfg) -> int:
     spec["dashboard"] = dash
 
     driver_spec = {k: spec.get(k) for k in (
-        "run_id", "name", "repo_path", "sha", "cmd", "env", "mem_gb",
+        "run_id", "name", "repo_path", "sha", "cmd", "env", "mem_gb", "cpus",
         "artifacts_dir", "timeout_s", "keep_tree_on_failure", "dashboard")}
     b64 = base64.b64encode(json.dumps(driver_spec).encode()).decode()
     entrypoint = (
@@ -146,9 +157,11 @@ def cmd_submit(args, ccfg) -> int:
         "sha": spec["sha"],
         "cmd": spec["cmd"],
         "mem_gb": spec["mem_gb"],
+        "cpus": spec["cpus"],
         "entrypoint": entrypoint,
         "metadata": {"name": spec["name"], "sha": spec["sha"],
                      "mem_gb": str(spec["mem_gb"]),
+                     "cpus": str(spec["cpus"]),
                      "desc": dash["desc"][:200],
                      "branch": dash["branch"], "dirty": "1" if dash["dirty"] else "0",
                      **({"variant": dash["variant"]} if dash.get("variant") else {})},
@@ -206,7 +219,7 @@ def cmd_status(args, ccfg) -> int:
         else:
             j = jobs.get(args.run_id)
             print(f"ray:     {j['status']}  ({j.get('message') or ''})".rstrip())
-            for k in ("name", "sha", "mem_gb"):
+            for k in ("name", "sha", "mem_gb", "cpus"):
                 if k in (j.get("metadata") or {}):
                     print(f"{k}:{' ' * (8 - len(k))}{j['metadata'][k]}")
         res = tunnel.ssh_run(
@@ -230,10 +243,23 @@ def cmd_status(args, ccfg) -> int:
     used = sum(float((j.get("metadata") or {}).get("mem_gb", 0)) for j in active)
     sched = qs["schedulable_mem_gb"]
     pend = qs["pending"]
-    print(f"capacity: {used:g}/{sched:g} GB reserved ({sched - used:g} free; "
-          f"vllm_reserve={qs['vllm_reserve_gb']:g}, config {qs['capacity_path']})")
+    # CPU slots, read the same way the admitter reads them (a job with no
+    # `cpus` metadata predates CPU slots and counts at default_cpus).
+    dcpus = int(qs.get("default_cpus") or config.DEFAULT_CPUS)
+    used_cpus = sum(config.cpus_of({"default_cpus": dcpus},
+                                   (j.get("metadata") or {}).get("cpus"))
+                    for j in active)
+    sched_cpus = qs.get("schedulable_cpus")
+    cpu_part = (f"{used_cpus}/{sched_cpus} cpus reserved" if sched_cpus is not None
+                else f"{used_cpus} cpus reserved (no cpu limit)")
+    print(f"capacity: {used:g}/{sched:g} GB, {cpu_part} "
+          f"({sched - used:g} GB"
+          + (f", {sched_cpus - used_cpus} cpus" if sched_cpus is not None else "")
+          + f" free; vllm_reserve={qs['vllm_reserve_gb']:g}, "
+          f"config {qs['capacity_path']})")
     print(f"queued:   {len(pend)} job(s) waiting for a slot"
-          + (f" ({sum(float(e['mem_gb']) for e in pend):g} GB)" if pend else ""))
+          + (f" ({sum(float(e['mem_gb']) for e in pend):g} GB, "
+             f"{sum(int(e.get('cpus') or dcpus) for e in pend)} cpus)" if pend else ""))
     if not qs["admitter_ok"]:
         age = qs["heartbeat_age_s"]
         print(f"WARNING:  spark-admit is not running "
@@ -244,11 +270,17 @@ def cmd_status(args, ccfg) -> int:
         print("no running or queued jobs")
     for j in sorted(active, key=lambda j: j.get("submission_id") or ""):
         md = j.get("metadata") or {}
+        cpus = md.get("cpus")
+        cpus = f"{cpus:>2s}" if cpus else f"{dcpus:>2d}*"
         print(f"  {j.get('submission_id'):44s} {j['status']:8s} "
-              f"mem_gb={md.get('mem_gb', '?'):>5s} sha={md.get('sha', '?')[:12]}")
+              f"mem_gb={md.get('mem_gb', '?'):>5s} cpus={cpus:3s} "
+              f"sha={md.get('sha', '?')[:12]}")
     for i, e in enumerate(pend, 1):
         print(f"  {e['run_id']:44s} {'QUEUED':8s} "
-              f"mem_gb={e['mem_gb']:>5g} sha={e['sha'][:12]} #{i}")
+              f"mem_gb={e['mem_gb']:>5g} cpus={int(e.get('cpus') or dcpus):>2d}  "
+              f"sha={e['sha'][:12]} #{i}")
+    if any(not (j.get("metadata") or {}).get("cpus") for j in active):
+        print(f"  (* submitted before CPU slots; counted at default_cpus={dcpus})")
     return 0
 
 
@@ -369,7 +401,9 @@ def cmd_doctor(args, ccfg) -> int:
             raise RuntimeError(f"schedulable_mem_gb={cap['schedulable_mem_gb']}")
         return (f"schedulable={cap['schedulable_mem_gb']:g} GB "
                 f"(total {cap['total_mem_gb']:g} - os {cap['os_reserve_gb']:g}"
-                f" - vllm {cap['vllm_reserve_gb']:g})")
+                f" - vllm {cap['vllm_reserve_gb']:g}); "
+                f"schedulable_cpus={cap.get('schedulable_cpus') or 'UNSET (host cores)'}"
+                f", default_cpus={cap['default_cpus']}")
     check("capacity config sane", _cap)
     check("ledger writable", lambda: tunnel.ssh_run(
         ccfg["host"],
@@ -401,6 +435,11 @@ def main() -> None:
     s.add_argument("--cmd", help="shell command, cwd = pinned worktree")
     s.add_argument("--env", action="append", metavar="K=V")
     s.add_argument("--mem-gb", type=float)
+    s.add_argument("--cpus", type=int,
+                   help="CPU slots the job uses (default: capacity.toml "
+                        "default_cpus). Admission waits until this many are "
+                        "free; the job sees SPARK_CPUS and, unless --env sets "
+                        "it, WORKERS set to this number")
     s.add_argument("--class", dest="job_class", help="budget class from capacity.toml")
     s.add_argument("--artifacts-dir")
     s.add_argument("--timeout-s", type=float)

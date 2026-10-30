@@ -120,6 +120,8 @@ def ledger_row(entry: dict, status: str, **extra) -> dict:
         "mem_gb": entry["mem_gb"],
         "status": status,
     }
+    if entry.get("cpus") is not None:
+        row["cpus"] = entry["cpus"]
     row.update(extra)
     return row
 
@@ -183,11 +185,14 @@ def state(cfg: dict) -> dict:
         "total_mem_gb": cfg["total_mem_gb"],
         "os_reserve_gb": cfg["os_reserve_gb"],
         "vllm_reserve_gb": cfg["vllm_reserve_gb"],
+        "schedulable_cpus": cfg.get("schedulable_cpus"),
+        "default_cpus": cfg.get("default_cpus", config.DEFAULT_CPUS),
         "capacity_path": cfg["_path"],
         "heartbeat_age_s": age,
         "admitter_ok": age is not None and age <= HEARTBEAT_STALE_S,
         "pending": [
             {"run_id": e["run_id"], "name": e["name"], "mem_gb": e["mem_gb"],
+             "cpus": config.cpus_of(cfg, e.get("cpus")),
              "sha": e["sha"], "queued_ts": e.get("queued_ts", "")}
             for _, e in pending(cfg)
         ],
