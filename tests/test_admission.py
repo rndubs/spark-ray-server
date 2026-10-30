@@ -78,13 +78,18 @@ class Base(unittest.TestCase):
 
     # -- helpers ---------------------------------------------------------
 
-    def enqueue(self, run_id, mem_gb=8.0):
-        return queue.enqueue(self.cfg, {
+    def enqueue(self, run_id, mem_gb=8.0, cpus=None):
+        md = {"name": run_id, "sha": "a" * 40, "mem_gb": str(mem_gb)}
+        entry = {
             "run_id": run_id, "name": run_id.split("-")[0], "sha": "a" * 40,
             "cmd": "true", "mem_gb": mem_gb,
             "entrypoint": f"python -m spark_orchestrator.driver {run_id}",
-            "metadata": {"name": run_id, "sha": "a" * 40, "mem_gb": str(mem_gb)},
-        })
+            "metadata": md,
+        }
+        if cpus is not None:  # None = an entry from a pre-CPU-slot client
+            entry["cpus"] = cpus
+            md["cpus"] = str(cpus)
+        return queue.enqueue(self.cfg, entry)
 
     def rows(self, run_id=None):
         rs = ledger.read_rows(config.ledger_path(self.cfg))
@@ -288,6 +293,183 @@ class TestAdmissionControl(Base):
                           "a failed loop must not look healthy")
 
 
+class TestCpuSlots(Base):
+    """CPU-slot admission (2026-10-30). Memory-only admission let CPU-bound
+    jobs pile onto the 20-core GB10 at load ~52 with 12 of 121 GB in use."""
+
+    def setUp(self):
+        super().setUp()
+        self.cfg["schedulable_cpus"] = 20
+        self.cfg["default_cpus"] = 6
+
+    def ids_in_ray(self):
+        return sorted(j["submission_id"] for j in self.ray.list())
+
+    def test_cpus_limit_admission_when_memory_would_fit(self):
+        # 10 x 8 GB = 80 GB fits in 112, but 10 x 4 cpus = 40 > 20.
+        for i in range(10):
+            self.enqueue(f"job-{i:02d}", 8.0, cpus=4)
+        self.adm.tick()
+        self.assertEqual(self.ids_in_ray(), [f"job-{i:02d}" for i in range(5)])
+        self.assertEqual(admit.reserved_cpus(self.ray.list(), 6), 20)
+        self.assertEqual(self.adm.tick()["reserved_cpus"], 20)
+        self.assertEqual(len(self.pending_ids()), 5)
+
+    def test_memory_still_limits_when_cpus_would_fit(self):
+        for i in range(3):
+            self.enqueue(f"job-{i}", 50.0, cpus=1)
+        self.adm.tick()
+        self.assertEqual(self.ids_in_ray(), ["job-0", "job-1"])
+
+    def test_both_must_fit_and_fifo_still_blocks_on_cpus(self):
+        """Head-of-line blocking applies to CPU too: a 16-cpu head that does
+        not fit must not be overtaken by a 1-cpu job behind it."""
+        self.enqueue("running", 8.0, cpus=10)
+        self.adm.tick()
+        self.enqueue("wide", 8.0, cpus=16)
+        self.enqueue("narrow", 8.0, cpus=1)
+        self.adm.tick()
+        self.assertEqual(self.pending_ids(), ["wide", "narrow"])
+        self.run_all("running")
+        self.adm.tick()
+        self.assertEqual(self.ids_in_ray(), ["narrow", "running", "wide"])
+
+    def test_freed_cpus_are_reused(self):
+        for i in range(6):
+            self.enqueue(f"job-{i}", 1.0, cpus=5)
+        self.adm.tick()
+        self.assertEqual(len(self.pending_ids()), 2)
+        self.run_all("job-0")
+        self.adm.tick()
+        self.assertEqual(self.pending_ids(), ["job-5"])
+
+    def test_legacy_running_job_without_cpus_counts_as_default(self):
+        """A job already in Ray from before this change has no `cpus` in its
+        metadata; it must reserve default_cpus, not zero."""
+        for i in range(3):
+            self.ray.submit(entrypoint="x", submission_id=f"legacy-{i}",
+                            entrypoint_resources={"mem_gb": 8.0},
+                            metadata={"mem_gb": "8.0"})
+        self.ray.set("legacy-0", "RUNNING")
+        self.assertEqual(admit.reserved_cpus(self.ray.list(), 6), 18)
+        self.enqueue("new-1", 1.0, cpus=2)
+        self.enqueue("new-2", 1.0, cpus=1)
+        self.adm.tick()
+        self.assertEqual(self.pending_ids(), ["new-2"])  # 18 + 2 = 20, full
+
+    def test_legacy_queue_entry_without_cpus_is_admitted_at_default(self):
+        """An entry from an older client carries no cpus: it is admitted
+        against default_cpus, and its Ray metadata says so, so the next loop
+        reads the same reservation back."""
+        for i in range(4):
+            self.enqueue(f"old-{i}", 1.0)
+        self.adm.tick()
+        self.assertEqual(self.ids_in_ray(), ["old-0", "old-1", "old-2"])  # 3 x 6 = 18
+        for j in self.ray.list():
+            self.assertEqual(j["metadata"]["cpus"], "6")
+        self.assertEqual(admit.reserved_cpus(self.ray.list(), 6), 18)
+
+    def test_terminal_jobs_hold_no_cpus(self):
+        self.enqueue("job-1", 1.0, cpus=20)
+        self.adm.tick()
+        self.run_all("job-1")
+        self.assertEqual(admit.reserved_cpus(self.ray.list(), 6), 0)
+
+    def test_impossible_cpus_fail_instead_of_blocking_forever(self):
+        self.enqueue("impossible", 1.0, cpus=64)
+        self.enqueue("fine", 1.0, cpus=2)
+        self.adm.tick()
+        row = self.latest("impossible")
+        self.assertEqual(row["status"], "failed")
+        self.assertIn("cpus=64", row["reason"])
+        self.assertIn("can never run", row["reason"])
+        self.assertEqual(self.ids_in_ray(), ["fine"])
+
+    def test_queue_state_reports_cpus(self):
+        self.enqueue("a", 1.0, cpus=3)
+        self.enqueue("b", 1.0)
+        st = queue.state(self.cfg)
+        self.assertEqual(st["schedulable_cpus"], 20)
+        self.assertEqual(st["default_cpus"], 6)
+        self.assertEqual([p["cpus"] for p in st["pending"]], [3, 6])
+
+    def test_queued_ledger_row_carries_cpus(self):
+        self.enqueue("a", 1.0, cpus=3)
+        self.assertEqual(self.latest("a")["cpus"], 3)
+
+
+class TestCpuConfig(unittest.TestCase):
+    BASE = ("total_mem_gb = 121\nos_reserve_gb = 9\nvllm_reserve_gb = 0\n")
+
+    def test_explicit_values_are_read(self):
+        cfg = config.load_capacity(self.BASE + "schedulable_cpus = 20\ndefault_cpus = 6\n")
+        self.assertEqual((cfg["schedulable_cpus"], cfg["default_cpus"]), (20, 6))
+
+    def test_client_parse_never_substitutes_its_own_core_count(self):
+        """`text` = a config fetched over ssh by the Mac client; defaulting to
+        the Mac's cores would check against the wrong machine."""
+        cfg = config.load_capacity(self.BASE)
+        self.assertIsNone(cfg["schedulable_cpus"])
+        self.assertEqual(cfg["default_cpus"], config.DEFAULT_CPUS)
+
+    def test_server_defaults_schedulable_cpus_to_host_cores(self):
+        import os
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "capacity.toml"
+            p.write_text(self.BASE)
+            old = config.CAPACITY_PATHS
+            config.CAPACITY_PATHS = [p]
+            try:
+                cfg = config.load_capacity()
+            finally:
+                config.CAPACITY_PATHS = old
+        self.assertEqual(cfg["schedulable_cpus"], os.cpu_count())
+
+    def test_cpus_of(self):
+        cfg = {"default_cpus": 6}
+        self.assertEqual(config.cpus_of(cfg, None), 6)
+        self.assertEqual(config.cpus_of(cfg, ""), 6)
+        self.assertEqual(config.cpus_of(cfg, "4"), 4)
+        self.assertEqual(config.cpus_of(cfg, 2), 2)
+
+
+class TestDriverEnv(unittest.TestCase):
+    """The declaration and the job's actual parallelism must agree: job
+    scripts read `${WORKERS:-8}`, so the driver sets WORKERS to the declared
+    cpus unless the job set WORKERS itself."""
+
+    CFG = {"default_cpus": 6}
+
+    def spec(self, **kw):
+        s = {"run_id": "r", "sha": "a" * 40, "artifacts_dir": "/art"}
+        s.update(kw)
+        return s
+
+    def env(self, spec, base=None):
+        from spark_orchestrator import driver
+        return driver.job_env(spec, self.CFG, base or {"PATH": "/bin"})
+
+    def test_declared_cpus_set_spark_cpus_and_workers(self):
+        e = self.env(self.spec(cpus=4))
+        self.assertEqual((e["SPARK_CPUS"], e["WORKERS"]), ("4", "4"))
+        self.assertEqual(e["PATH"], "/bin")
+        self.assertEqual(e["SPARK_RUN_ID"], "r")
+
+    def test_spec_env_workers_wins(self):
+        e = self.env(self.spec(cpus=4, env={"WORKERS": "2"}))
+        self.assertEqual((e["SPARK_CPUS"], e["WORKERS"]), ("4", "2"))
+
+    def test_no_declaration_uses_default(self):
+        e = self.env(self.spec())
+        self.assertEqual((e["SPARK_CPUS"], e["WORKERS"]), ("6", "6"))
+
+    def test_inherited_workers_is_overridden(self):
+        """Only the job's OWN env may override WORKERS; a stray WORKERS in the
+        Ray worker's environment must not decouple it from the declaration."""
+        e = self.env(self.spec(cpus=3), base={"WORKERS": "16"})
+        self.assertEqual(e["WORKERS"], "3")
+
+
 class TestCrashSafety(Base):
     def test_resubmitting_after_a_crash_adopts_the_existing_ray_job(self):
         """We POST to Ray before moving the queue entry, so a crash in between
@@ -417,10 +599,30 @@ class TestClientRendering(unittest.TestCase):
         self.qs["pending"] = [{"run_id": "q-1", "name": "q", "mem_gb": 8.0,
                                "sha": "c" * 40, "queued_ts": ""}]
         out = self.status()
-        self.assertIn("104/112 GB reserved (8 free", out)  # PENDING counted
-        self.assertIn("queued:   1 job(s) waiting for a slot (8 GB)", out)
+        self.assertIn("104/112 GB,", out)  # PENDING counted
+        self.assertIn("(8 GB", out)
+        self.assertIn("queued:   1 job(s) waiting for a slot (8 GB, 6 cpus)", out)
         self.assertIn("q-1", out)
         self.assertIn("QUEUED", out)
+
+    def test_status_shows_cpu_reservation_beside_memory(self):
+        self.qs.update(schedulable_cpus=20, default_cpus=6)
+        self.ray_jobs = [
+            {"submission_id": "r-1", "status": "RUNNING",
+             "metadata": {"mem_gb": "96.0", "cpus": "12", "sha": "b" * 40}},
+            {"submission_id": "legacy", "status": "RUNNING",
+             "metadata": {"mem_gb": "8.0", "sha": "b" * 40}},
+        ]
+        self.qs["pending"] = [{"run_id": "q-1", "name": "q", "mem_gb": 8.0,
+                               "cpus": 4, "sha": "c" * 40, "queued_ts": ""}]
+        out = self.status()
+        self.assertIn("capacity: 104/112 GB, 18/20 cpus reserved", out)
+        self.assertIn("2 cpus free", out)
+        self.assertIn("cpus=12", out)
+        self.assertIn("cpus= 6*", out)   # legacy job, counted at the default
+        self.assertIn("counted at default_cpus=6", out)
+        self.assertIn("cpus= 4", out)    # queued job
+        self.assertIn("(8 GB, 4 cpus)", out)
 
     def test_status_warns_loudly_when_the_admitter_is_down(self):
         self.qs.update(admitter_ok=False, heartbeat_age_s=None)

@@ -79,6 +79,7 @@ def _end_row(status: str, exit_code: int | None, **extra) -> dict:
         "sha": spec["sha"],
         "cmd": spec["cmd"],
         "mem_gb": spec["mem_gb"],
+        "cpus": config.cpus_of(cfg, spec.get("cpus")),
         "status": status,
         "exit_code": exit_code,
         "duration_s": round(time.monotonic() - _state["t0"], 1),
@@ -124,6 +125,28 @@ def _tee(pipe, log_file) -> None:
         sys.stdout.buffer.flush()
 
 
+def job_env(spec: dict, cfg: dict, base) -> dict:
+    """The job command's environment.
+
+    SPARK_CPUS is the number of CPU slots the scheduler admitted this job
+    against. WORKERS is set to the same number unless the job's own env sets
+    it, because job scripts commonly read `${WORKERS:-8}`: without this a job
+    admitted for 6 cores would still fan out to 8 and the declaration would
+    mean nothing. An explicit `--env WORKERS=N` always wins.
+    """
+    env = dict(base)
+    spec_env = spec.get("env") or {}
+    env.update(spec_env)
+    env["SPARK_RUN_ID"] = spec["run_id"]
+    env["SPARK_SHA"] = spec["sha"]
+    env["SPARK_ARTIFACTS_DIR"] = spec["artifacts_dir"]
+    cpus = config.cpus_of(cfg, spec.get("cpus"))
+    env["SPARK_CPUS"] = str(cpus)
+    if "WORKERS" not in spec_env:
+        env["WORKERS"] = str(cpus)
+    return env
+
+
 def main() -> int:
     spec = json.loads(base64.b64decode(sys.argv[1]))
     cfg = config.load_capacity()
@@ -149,6 +172,7 @@ def main() -> int:
         "sha": spec["sha"],
         "cmd": spec["cmd"],
         "mem_gb": spec["mem_gb"],
+        "cpus": config.cpus_of(cfg, spec.get("cpus")),
         "artifacts_dir": spec["artifacts_dir"],
         "log_path": str(log_path),
         "worktree": str(tree),
@@ -173,6 +197,7 @@ def main() -> int:
             "sha": spec["sha"],
             "cmd": spec["cmd"],
             "mem_gb": spec["mem_gb"],
+            "cpus": config.cpus_of(cfg, spec.get("cpus")),
             "status": "started",
             "repo_path": str(repo),
             "artifacts_dir": spec["artifacts_dir"],
@@ -215,11 +240,7 @@ def main() -> int:
     _state["sidecar"].update(guard.verdict())
     _write_sidecar()
 
-    env = dict(os.environ)
-    env.update(spec.get("env") or {})
-    env["SPARK_RUN_ID"] = spec["run_id"]
-    env["SPARK_SHA"] = spec["sha"]
-    env["SPARK_ARTIFACTS_DIR"] = spec["artifacts_dir"]
+    env = job_env(spec, cfg, os.environ)
 
     timeout_s = spec.get("timeout_s")
     status, exit_code = "succeeded", 0

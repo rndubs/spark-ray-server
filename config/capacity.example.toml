@@ -15,6 +15,16 @@ vllm_reserve_gb = 72      # operator vLLM at --gpu-memory-utilization 0.60
                           # (0.60 x 121; `free` confirms ~43 GB left). Set 0
                           # when the server is down.
 
+# CPU-slot admission (2026-10-30). A job is admitted only when BOTH its mem_gb
+# and its cpus fit. Memory-only admission ran the 20-core GB10 at load ~52 with
+# 12 of 121 GB in use (8-worker harnesses + cargo -j 8 each): every job ~2x
+# slower, load-induced timeouts. Jobs declare --cpus; undeclared (and jobs
+# submitted before this existed) count as default_cpus. The driver exports
+# SPARK_CPUS, and WORKERS unless the job's env sets it. schedulable_cpus
+# defaults to the host's core count. Restart spark-admit after changing these.
+schedulable_cpus = 20
+default_cpus = 6
+
 # Per-job-class default budgets (GB). Overridden per job with --mem-gb.
 # Measured on the GB10 (measured_on = 2026-07-18, acceptance gate 7):
 # 500-step baseline train: peak RSS 2.9 GB, system-wide MemAvailable dip

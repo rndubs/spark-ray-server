@@ -47,8 +47,25 @@ sparkctl gc [--dry-run]
 Submit as many jobs as you like at once; **clients must not pace submissions.**
 `submit` enqueues into `~/spark-runs/queue/pending` on the Spark and returns.
 The `spark-admit` daemon hands a job to Ray strictly FIFO, and only once its
-declared `mem_gb` is actually free — so a job is PENDING inside Ray for
-seconds, not minutes.
+declared `mem_gb` **and** its declared `cpus` are both free — so a job is
+PENDING inside Ray for seconds, not minutes.
+
+**CPU slots (since 2026-10-30).** Every job declares `cpus` (`--cpus N`, or
+`cpus` in a spec file; default `default_cpus` from `capacity.toml`, 6 on the
+Spark). Admission holds the queue head until `cpus` slots are free out of
+`schedulable_cpus` (20 on the Spark = its core count). Before this, admission
+was on memory alone: CPU-bound harnesses (8 workers plus `cargo -j 8` each)
+were co-admitted until the 20-core box ran at load ~52 with 12 of 121 GB in
+use, every job ~2× slower and load-induced timeouts appearing. The driver
+exports `SPARK_CPUS=<cpus>` to the job, and also `WORKERS=<cpus>` **unless the
+job's own `--env` sets `WORKERS`** — scripts that read `${WORKERS:-8}` then
+fan out to exactly what was reserved. Declare what the job really runs in
+parallel (workers + a compiler's `-j`), and size `-j`/thread pools from
+`$SPARK_CPUS`. Jobs submitted before CPU slots existed carry no `cpus` and
+are counted at `default_cpus`. A `cpus` over `schedulable_cpus` is rejected at
+submit (and failed by the admitter if capacity shrinks under it). CPU slots are
+a scheduling reservation only — nothing pins a job to cores. **Do not inflate
+`mem_gb` to throttle CPU work; declare `cpus`.**
 
 That matters because Ray fails any job that stays PENDING past its
 job-supervisor start timeout (`RAY_JOB_START_TIMEOUT_SECONDS`, default 900 s),
@@ -69,7 +86,7 @@ the queue and warns loudly if the admitter is not running; queued work is on
 disk and survives a daemon restart or a reboot.
 
 Job spec JSON (spec §2): `{name, repo_path, ref, cmd, env{}, mem_gb |
-job_class, artifacts_dir, timeout_s, keep_tree_on_failure}`. `ref` resolves
+job_class, cpus, artifacts_dir, timeout_s, keep_tree_on_failure}`. `ref` resolves
 to a SHA at submission; the SHA is what runs. Client config (optional):
 `config/client.example.toml` → `~/.config/spark-orchestrator/client.toml`.
 
@@ -81,7 +98,8 @@ from other repos.
 
 Contract with the consumer repo (spec §5): the job is an arbitrary shell
 command run with `cwd` = the pinned worktree, caller env plus injected
-`SPARK_RUN_ID`, `SPARK_SHA`, `SPARK_ARTIFACTS_DIR`; success == exit 0; put
+`SPARK_RUN_ID`, `SPARK_SHA`, `SPARK_ARTIFACTS_DIR`, `SPARK_CPUS` (and
+`WORKERS` = the declared cpus unless the job's env sets it); success == exit 0; put
 anything durable in `$SPARK_ARTIFACTS_DIR` (the worktree is disposable).
 
 ## Server (Spark)
@@ -112,7 +130,10 @@ Capacity config: `~/.config/spark-orchestrator/capacity.toml` (see
 vllm_reserve`. When you bring the operator vLLM server up or down, edit
 `vllm_reserve_gb` and `systemctl --user restart spark-ray.service` (with no
 jobs running). Budgets in `[budgets]` are measured, not guessed — remeasure
-when a workload changes materially.
+when a workload changes materially. `schedulable_cpus` (default: the host's
+core count) and `default_cpus` (default 6) set CPU-slot admission; the
+admitter reads them at start, so `systemctl --user restart spark-admit` after
+changing them (no Ray restart needed).
 
 ## Training dashboard
 

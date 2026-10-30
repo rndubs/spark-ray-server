@@ -259,6 +259,7 @@ async function refreshDetail(id) {
     ["resources", row.resources ? `RSS ${fmtGB(row.resources.rss_mb)}` +
       (row.resources.gpu_mem_mb!=null? `  ·  GPU ${fmtGB(row.resources.gpu_mem_mb)} (unified: overlaps RSS)`:"") : "—"],
     ["mem budget", row.mem_gb!=null? row.mem_gb+" GB":"—"],
+    ["cpu slots", row.cpus!=null? String(row.cpus):"— (pre-CPU-slot job: default)"],
     ["artifacts", row.artifacts_dir||"—"],
     ["run dir", row.run_dir||"—"],
   ];

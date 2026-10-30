@@ -64,6 +64,17 @@ Then submit with `--class my-train` (uses the budget) or `--mem-gb N` (ad-hoc).
 A job whose `mem_gb` exceeds `schedulable_mem_gb` is rejected at submit — it
 could never run.
 
+**Declare CPU slots too (since 2026-10-30): `--cpus N`** (or `cpus` in a spec
+file; default `default_cpus` in `capacity.toml`). The queue head is admitted
+only when both its memory and its CPU slots fit in `schedulable_cpus` (the
+host's core count unless set; 20 on the Spark). The driver exports
+`SPARK_CPUS=<cpus>`, and `WORKERS=<cpus>` unless your `--env` sets `WORKERS`,
+so `${WORKERS:-8}`-style scripts follow the reservation. Count everything the
+job runs in parallel (pool workers + a compiler's `-j`). A `cpus` over
+`schedulable_cpus` is rejected at submit. Slots are scheduling bookkeeping —
+nothing pins a job to cores — so an honest number is what keeps the box from
+running at 2.5× its core count.
+
 **What you declare is what you get.** Since 2026-07-26 the number is enforced:
 your command runs inside its own cgroup with `MemoryMax` set to it and swap
 capped at zero, so going over kills *your* job — terminal ledger status
